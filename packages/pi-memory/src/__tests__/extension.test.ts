@@ -46,12 +46,16 @@ describe('memoryExtension', () => {
       },
       registerTool: vi.fn(),
       registerCommand: vi.fn(),
+      appendEntry: vi.fn(),
     };
     const ctx = {
       cwd: dir,
       signal: new AbortController().signal,
       sessionManager: {
         getSessionDir: () => path.join(dir, 'sessions'),
+        getBranch: () => [],
+        getEntries: () => [],
+        getSessionId: () => 'test-session',
       },
       ui: { notify: vi.fn(), setStatus: vi.fn() },
       modelRegistry: { find: () => null, getApiKeyAndHeaders: async () => ({ ok: false }) },
@@ -93,10 +97,16 @@ describe('memoryExtension', () => {
         },
         registerTool: vi.fn(),
         registerCommand: vi.fn(),
+        appendEntry: vi.fn(),
       };
       const ctx = {
         cwd: dir,
-        sessionManager: { getSessionDir: () => path.join(dir, 'sessions') },
+        sessionManager: {
+          getSessionDir: () => path.join(dir, 'sessions'),
+          getBranch: () => [],
+          getEntries: () => [],
+          getSessionId: () => 'test-session',
+        },
         ui: { notify: vi.fn(), setStatus: vi.fn() },
         modelRegistry: { find: () => null, getApiKeyAndHeaders: async () => ({ ok: false }) },
       };

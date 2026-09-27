@@ -20,7 +20,7 @@ This repository contains the open-source runtime contracts, adapters, and orches
 | Extension | `@amaster.ai/pi-web-access` | Web search, URL content extraction, and image search across configurable providers. |
 | Extension | `@amaster.ai/pi-computer-use` | Cross-platform computer-use tools for desktop automation. |
 | Extension | `@amaster.ai/pi-channels` | Native messaging channels: Feishu, WeCom, and webhooks. |
-| Extension | `@amaster.ai/pi-memory` | Persistent curated memory (`MEMORY.md` + `USER.md`) injected into the system prompt as a refreshed prompt snapshot. |
+| Extension | `@amaster.ai/pi-memory` | Persistent curated memory (`MEMORY.md` + `USER.md`) injected into the system prompt as a snapshot frozen between compactions. |
 | Extension | `@amaster.ai/pi-security` | Resource-aware security policy engine and tool authorization. |
 | Extension | `@amaster.ai/pi-teamwork` | Team collaboration and issue management via Multica. |
 | Extension | `@amaster.ai/pi-image-gen` | Image generation via OpenAI gpt-image, Google Nano Banana, Alibaba Qwen-Image, OpenRouter, and custom providers. |
