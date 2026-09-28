@@ -97,6 +97,9 @@ jobs:
             exit 1
           fi
 
+      - name: Verify pi-memory system snapshot across session resume and fork
+        run: node .github/scripts/pi-memory-snapshot-e2e.mjs
+
   computer-use-platform-e2e:
     name: Computer use driver E2E (${{ matrix.target }})
     needs: detect-extension-matrix
