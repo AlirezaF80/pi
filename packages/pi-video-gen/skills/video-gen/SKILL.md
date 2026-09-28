@@ -157,7 +157,7 @@ Field rules:
 
 ## C. Image operation manual (via `image_generate`)
 
-Generic `image_generate` usage (params, sizes, `n`, edit labeling) follows the **pi-image-gen skill** — it is the single authority; do not deviate. Two video-specific handoff rules:
+When a shot book needs missing character portraits or first/last frames, call `image_generate` to create those images before `video_render`. Follow the **pi-image-gen skill** for parameters, sizes, `n`, and edit labeling; it is the single authority. Two video-specific handoff rules:
 
 - **Never assume a saved filename**: the actual extension follows the MIME type and collisions get `-v2`. **The returned absolute path is the only truth** — record it immediately in `assets.json` (see below) and reference it in the render spec.
 - `assets.json` in the job dir: `{ "assets": { "<shotId>/<part>": { "sourcePath": "…" } } }` mapping semantic assets (e.g. `s1/firstFrame`, `alice/front`) to real paths.
