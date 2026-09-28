@@ -114,7 +114,12 @@ describe('parseTimelineSpec', () => {
 
   it('validates motion/transition/output fields', () => {
     const make = (extra: Record<string, unknown>) =>
-      JSON.stringify({ segments: [{ id: 's1', image: '/a.png', durationSec: 3, ...extra }] });
+      JSON.stringify({
+        segments: [
+          { id: 's1', image: '/a.png', durationSec: 3, ...extra },
+          { id: 's2', image: '/b.png', durationSec: 3 },
+        ],
+      });
     expect(() => parseTimelineSpec(make({ motion: 'fly' }))).toThrow(/motion must be one of/);
     expect(() =>
       parseTimelineSpec(make({ transitionTo: { type: 'warp', style: 'fade', durationSec: 1 } })),
@@ -239,6 +244,7 @@ describe('parseTimelineSpec', () => {
             transitionTo: { type: 'xfade', style: 'fade', durationSec: 0.8 },
             overlay: { title: '标题', subtitle: '副标题', position: 'bottom-center' },
           },
+          { id: 's2', image: '/b.png', durationSec: 3 },
         ],
       }),
     );

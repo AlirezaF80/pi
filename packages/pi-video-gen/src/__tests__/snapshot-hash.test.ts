@@ -87,7 +87,10 @@ describe('snapshot hash is of the SNAPSHOT bytes (not a pre-copy source read)', 
       activeJobs: new ActiveJobs(),
       rateLimiter: new RateLimiter(),
       ffmpegPath: 'unused',
-      concatImpl: (async () => {}) as never,
+      verifyMedia: false,
+      concatImpl: (async ({ outputPath }: { outputPath: string }) => {
+        writeFileSync(outputPath, 'final');
+      }) as never,
     });
 
     const manifest = loadRenderJob(jobDir)!;

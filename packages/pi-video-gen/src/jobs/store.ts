@@ -51,6 +51,9 @@ export type RenderShotState = {
   /** Orchestrator-computed identity for checking a persisted handle on resume. */
   requestFingerprint?: string | undefined;
   videoPath?: string | undefined;
+  source?: 'local' | undefined;
+  videoHash?: string | undefined;
+  localSourceHash?: string | undefined;
   error?: string | undefined;
 };
 
@@ -64,6 +67,10 @@ export type RenderJobManifest = {
   frameHashes: Record<string, string>;
   shots: Record<string, RenderShotState>;
   finalVideoPath?: string | undefined;
+  finalVideoHash?: string | undefined;
+  assemblyProjectHash?: string | undefined;
+  assemblyAssetHashes?: Record<string, string> | undefined;
+  qcHashes?: Record<string, string> | undefined;
   error?: string | undefined;
   updatedAt: string;
 };
@@ -322,6 +329,8 @@ function validateRenderManifest(raw: unknown, path: string): RenderJobManifest {
       'store: frameHashes invalid',
     );
   }
+  if (m.qcHashes !== undefined && !hasSha256Values(m.qcHashes))
+    throw new VideoGenError('Render QC hashes are invalid.', 'store: render qc hashes invalid');
 
   // Per-shot validation: a shot marked 'submitted' WITHOUT its remote handle
   // would be re-submitted on resume — a paid duplicate. Refuse truncated
@@ -341,7 +350,13 @@ function validateRenderManifest(raw: unknown, path: string): RenderJobManifest {
       typeof shot !== 'object' ||
       !VALID_STATES.has(shot.state) ||
       (shot.attempt !== undefined && (!Number.isSafeInteger(shot.attempt) || shot.attempt < 1)) ||
-      (HANDLE_REQUIRED.has(shot.state) && typeof shot.handle?.taskId !== 'string') ||
+      (HANDLE_REQUIRED.has(shot.state) &&
+        shot.source !== 'local' &&
+        typeof shot.handle?.taskId !== 'string') ||
+      (shot.source === 'local' &&
+        (shot.state !== 'done' ||
+          !/^[0-9a-f]{64}$/.test(shot.videoHash ?? '') ||
+          !/^[0-9a-f]{64}$/.test(shot.localSourceHash ?? ''))) ||
       (shot.handle !== undefined &&
         (typeof shot.requestFingerprint !== 'string' ||
           (shot.requestFingerprint !== 'manual-adopt' &&
@@ -353,6 +368,11 @@ function validateRenderManifest(raw: unknown, path: string): RenderJobManifest {
       );
     }
   }
+  if (m.assemblyAssetHashes !== undefined && !hasSha256Values(m.assemblyAssetHashes))
+    throw new VideoGenError(
+      'Render assembly asset hashes are invalid.',
+      'store: render assembly hashes invalid',
+    );
   return m as RenderJobManifest;
 }
 
@@ -373,6 +393,7 @@ export type TimelineSegmentState = {
   narrationDurationSec?: number | undefined;
   narrationDegraded?: boolean | undefined;
   resolvedDurationSec?: number | undefined;
+  sentenceTimings?: { text: string; startSec: number; endSec: number }[] | undefined;
 };
 
 export type TimelineJobManifest = {
@@ -426,7 +447,21 @@ export function loadTimelineJob(jobDir: string): TimelineJobManifest | undefined
           (typeof segment.resolvedDurationSec === 'number' &&
             Number.isFinite(segment.resolvedDurationSec) &&
             segment.resolvedDurationSec >= 0)) &&
-        (segment.narrationDegraded === undefined || typeof segment.narrationDegraded === 'boolean'),
+        (segment.narrationDegraded === undefined ||
+          typeof segment.narrationDegraded === 'boolean') &&
+        (segment.sentenceTimings === undefined ||
+          (Array.isArray(segment.sentenceTimings) &&
+            segment.sentenceTimings.every(
+              (cue) =>
+                isRecord(cue) &&
+                typeof cue.text === 'string' &&
+                typeof cue.startSec === 'number' &&
+                Number.isFinite(cue.startSec) &&
+                cue.startSec >= 0 &&
+                typeof cue.endSec === 'number' &&
+                Number.isFinite(cue.endSec) &&
+                cue.endSec > cue.startSec,
+            ))),
     );
   if (
     typeof manifest.jobId !== 'string' ||

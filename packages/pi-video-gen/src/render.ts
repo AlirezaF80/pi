@@ -1,6 +1,16 @@
-import { createHash } from 'node:crypto';
+import { COPYFILE_EXCL } from 'node:constants';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { resolveOutputDir } from './config.js';
 import {
@@ -12,12 +22,21 @@ import {
   toLogSummary,
   VideoGenError,
 } from './errors.js';
-import { concatVideos } from './ffmpeg.js';
+import {
+  concatVideos,
+  probeDuration,
+  probeStreams,
+  resolveFfprobe,
+  resolveGplFfmpeg,
+  runFfmpegCommand,
+} from './ffmpeg.js';
 import { readApprovedFrame } from './frame-input.js';
 import {
   type ActiveJobs,
   assertSafeId,
+  hashFileSha256,
   loadRenderJob,
+  loadTimelineJob,
   type RenderJobManifest,
   readJsonFile,
   saveRenderJob,
@@ -30,6 +49,15 @@ import {
   requestFingerprint,
 } from './providers/request.js';
 import { CancelledError, pollTask, type RateLimiter } from './providers/task.js';
+import {
+  parseRemotionSpec,
+  preflightRemotion,
+  type RemotionSpec,
+  runRemotion,
+} from './remotion.js';
+import { hasCjkFont } from './text-layer.js';
+import { parseTimelineSpec, type TimelineSpec } from './timeline.js';
+import { assertNarrationOptIn, runTimeline } from './timeline-render.js';
 import type {
   FilmPrompt,
   GenerateVideoParams,
@@ -59,7 +87,8 @@ import type {
 export type RenderShotInput = {
   id: string;
   /** Structured per-shot prompt fields — assembled via assemblePrompt before submit. */
-  prompt: ShotPrompt;
+  prompt?: ShotPrompt;
+  videoPath?: string;
   firstFramePath?: string | undefined;
   lastFramePath?: string | undefined;
   referenceAssets?: ReferenceAsset[] | undefined;
@@ -70,6 +99,17 @@ export type RenderInput = FilmPrompt & {
   title?: string | undefined;
   aspectRatio?: string | undefined;
   shots: RenderShotInput[];
+  assembly?:
+    | {
+        type: 'remotion';
+        projectDir: string;
+        compositionId: string;
+        entryPoint?: string;
+        inputProps?: Record<string, unknown>;
+        assets?: Record<string, string>;
+        browserExecutable?: string;
+      }
+    | { type: 'timeline'; timeline: TimelineSpec };
 };
 
 export type RenderRunResult = {
@@ -77,6 +117,9 @@ export type RenderRunResult = {
   finalVideoPath: string;
   shotsDone: number;
   degraded: string[];
+  qcFrames: string[];
+  qcReportPath?: string | undefined;
+  editableProjectDir?: string | undefined;
 };
 
 let snapshotCounter = 0;
@@ -85,7 +128,8 @@ function sha256hex(content: string | Buffer): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
-function specFingerprint(specRaw: string, resolved: ResolvedModel): string {
+function specFingerprint(specRaw: string, resolved?: ResolvedModel): string {
+  if (!resolved) return sha256hex(JSON.stringify({ spec: specRaw, mode: 'local' }));
   return sha256hex(
     JSON.stringify({
       spec: specRaw,
@@ -129,8 +173,31 @@ function sameKeys(actual: string[], expected: string[]): boolean {
   return actual.every((key) => wanted.has(key));
 }
 
+function assemblySources(spec: RenderInput, cwd: string): Record<string, string> {
+  if (spec.assembly?.type === 'remotion')
+    return Object.fromEntries(
+      Object.entries(spec.assembly.assets ?? {}).map(([id, path]) => [id, resolve(cwd, path)]),
+    );
+  if (spec.assembly?.type === 'timeline' && spec.assembly.timeline.bgm)
+    return { bgm: resolve(cwd, spec.assembly.timeline.bgm) };
+  return {};
+}
+
+function timelineWithShotPaths(timeline: TimelineSpec, shotsDir: string): TimelineSpec {
+  return {
+    ...timeline,
+    segments: timeline.segments.map(
+      (segment: TimelineSpec['segments'][number] & { shotId?: string }) => ({
+        ...segment,
+        video: join(shotsDir, segment.shotId!, 'video.mp4'),
+        shotId: undefined,
+      }),
+    ),
+  };
+}
+
 /** Manual validation with agent-fixable error messages (better than a schema dump). */
-function parseRenderSpec(raw: string): RenderInput {
+export function parseRenderSpec(raw: string): RenderInput {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -176,6 +243,27 @@ function parseRenderSpec(raw: string): RenderInput {
       );
     }
     seen.add(shot.id);
+    if (shot.videoPath !== undefined) {
+      if (typeof shot.videoPath !== 'string' || shot.videoPath.trim() === '') {
+        throw new VideoGenError(
+          `${where}.videoPath must be a non-empty path.`,
+          'render: bad video path',
+        );
+      }
+      if (
+        shot.prompt !== undefined ||
+        shot.firstFramePath !== undefined ||
+        shot.lastFramePath !== undefined ||
+        shot.referenceAssets !== undefined ||
+        shot.durationSec !== undefined
+      ) {
+        throw new VideoGenError(
+          `${where}.videoPath cannot be combined with generation fields.`,
+          'render: mixed shot source',
+        );
+      }
+      return;
+    }
     if (
       shot.firstFramePath !== undefined &&
       (typeof shot.firstFramePath !== 'string' || shot.firstFramePath.trim() === '')
@@ -230,6 +318,43 @@ function parseRenderSpec(raw: string): RenderInput {
       );
     }
   });
+  if (spec.assembly !== undefined) {
+    if (
+      !spec.assembly ||
+      typeof spec.assembly !== 'object' ||
+      !['remotion', 'timeline'].includes(spec.assembly.type)
+    )
+      throw new VideoGenError('assembly.type must be remotion or timeline.', 'render: assembly');
+    if (spec.assembly.type === 'remotion') {
+      parseRemotionSpec(JSON.stringify(spec.assembly));
+      for (const id of Object.keys(spec.assembly.assets ?? {}))
+        if (seen.has(id))
+          throw new VideoGenError(
+            `Remotion asset "${id}" conflicts with shot ID.`,
+            'render: asset collision',
+          );
+    }
+    if (spec.assembly.type === 'timeline') {
+      const timeline = spec.assembly.timeline;
+      if (!timeline || !Array.isArray(timeline.segments))
+        throw new VideoGenError('assembly.timeline must contain segments.', 'render: timeline');
+      const shotIds = new Set(spec.shots.map((shot) => shot.id));
+      for (const segment of timeline.segments as ((typeof timeline.segments)[number] & {
+        shotId?: string;
+      })[]) {
+        if (
+          typeof segment.shotId !== 'string' ||
+          !shotIds.has(segment.shotId) ||
+          segment.video !== undefined ||
+          segment.image !== undefined
+        )
+          throw new VideoGenError(
+            `Timeline segment ${segment.id ?? '?'} needs a valid shotId and no video/image path.`,
+            'render: timeline shot ref',
+          );
+      }
+    }
+  }
   return spec;
 }
 
@@ -259,17 +384,18 @@ export async function runRender(opts: {
   allowDegradations?: string[] | undefined;
   settings: VideoGenSettings;
   cwd: string;
-  resolved: ResolvedModel;
-  adapter: VideoProviderAdapter;
+  resolved?: ResolvedModel | undefined;
+  adapter?: VideoProviderAdapter | undefined;
   activeJobs: ActiveJobs;
   rateLimiter: RateLimiter;
   ffmpegPath: string;
+  trusted?: boolean;
   signal?: AbortSignal | undefined;
   onUpdate?: ((msg: string) => void) | undefined;
   concatImpl?: typeof concatVideos | undefined;
+  verifyMedia?: boolean | undefined;
 }): Promise<RenderRunResult> {
   const { settings, cwd, resolved, adapter } = opts;
-  const caps = resolved.entry.capabilities;
   const outputDir = resolveOutputDir(settings, cwd);
 
   // 1. spec + job identity
@@ -281,6 +407,14 @@ export async function runRender(opts: {
     );
   });
   const spec = parseRenderSpec(specRaw);
+  const generated = spec.shots.filter((shot) => !shot.videoPath);
+  if (generated.length && (!resolved || !adapter)) {
+    throw new VideoGenError(
+      'Generated shots require a configured video model and provider.',
+      'render: model missing',
+    );
+  }
+  const caps = resolved?.entry.capabilities;
 
   // Containment must survive symlinks: compare REAL paths, not lexical
   // prefixes — a symlinked jobDir would otherwise let writes escape outputDir.
@@ -307,41 +441,60 @@ export async function runRender(opts: {
 
   // 2. capability preflight — fail BEFORE anything paid
   const degraded: string[] = [];
-  const wantsLastFrame = spec.shots.filter((s) => s.lastFramePath).map((s) => s.id);
-  if (wantsLastFrame.length > 0 && !caps.supportsFirstLastFrame) {
+  const wantsLastFrame = generated.filter((s) => s.lastFramePath).map((s) => s.id);
+  if (wantsLastFrame.length > 0 && !caps?.supportsFirstLastFrame) {
     if (opts.allowDegradations?.includes('first-frame-only')) {
       for (const shot of spec.shots) shot.lastFramePath = undefined;
       degraded.push(`first-frame-only (dropped last frames for: ${wantsLastFrame.join(', ')})`);
     } else {
       throw new VideoGenError(
-        `Shots ${wantsLastFrame.join(', ')} request last-frame interpolation, but ${resolved.entry.id} does not support it. Options: switch model (/video-gen models), remove lastFramePath from those shots, or explicitly pass allowDegradations: ["first-frame-only"].`,
+        `Shots ${wantsLastFrame.join(', ')} request last-frame interpolation, but ${resolved?.entry.id} does not support it. Options: switch model (/video-gen models), remove lastFramePath from those shots, or explicitly pass allowDegradations: ["first-frame-only"].`,
         'render: flf unsupported',
       );
     }
   }
-  if (spec.aspectRatio && !caps.aspectRatios.includes(spec.aspectRatio)) {
+  if (spec.aspectRatio && caps && !caps.aspectRatios.includes(spec.aspectRatio)) {
     throw new VideoGenError(
-      `aspectRatio must be one of ${caps.aspectRatios.join(', ')} for ${resolved.entry.id} (got ${spec.aspectRatio}).`,
+      `aspectRatio must be one of ${caps.aspectRatios.join(', ')} for ${resolved?.entry.id} (got ${spec.aspectRatio}).`,
       'render: bad ratio',
     );
   }
-  for (const shot of spec.shots) {
+  for (const shot of generated) {
     const referenceError = referenceAssetPreflightError({
-      providerStyle: resolved.provider.style,
-      modelId: resolved.entry.id,
-      capabilities: caps,
+      providerStyle: resolved!.provider.style,
+      modelId: resolved!.entry.id,
+      capabilities: caps!,
       referenceAssets: shot.referenceAssets ?? [],
       localImageReferences: (shot.firstFramePath ? 1 : 0) + (shot.lastFramePath ? 1 : 0),
     });
     if (referenceError) {
       throw new VideoGenError(`Shot "${shot.id}": ${referenceError}`, 'render: invalid references');
     }
-    const d = shot.durationSec ?? resolved.entry.defaultDurationSec;
-    if (d < caps.durations[0] || d > caps.durations[1]) {
+    const d = shot.durationSec ?? resolved!.entry.defaultDurationSec;
+    if (d < caps!.durations[0] || d > caps!.durations[1]) {
       throw new VideoGenError(
-        `Shot "${shot.id}" durationSec ${d}s is outside ${caps.durations[0]}-${caps.durations[1]}s for ${resolved.entry.id}.`,
+        `Shot "${shot.id}" durationSec ${d}s is outside ${caps!.durations[0]}-${caps!.durations[1]}s for ${resolved!.entry.id}.`,
         'render: bad duration',
       );
+    }
+  }
+  for (const shot of spec.shots) {
+    if (!shot.videoPath) continue;
+    const source = await stat(resolve(cwd, shot.videoPath)).catch(() => null);
+    if (!source?.isFile() || source.size === 0)
+      throw new VideoGenError(
+        `Local shot "${shot.id}" is missing or empty.`,
+        'render: local source invalid',
+      );
+    if (opts.verifyMedia !== false) {
+      const ffprobe = resolveFfprobe(settings.ffmpegPath);
+      if (!ffprobe.runnable)
+        throw new VideoGenError(
+          'ffprobe is required to validate existing video before model submission.',
+          'render: ffprobe missing',
+        );
+      await probeStreams(ffprobe.path, resolve(cwd, shot.videoPath), opts.signal);
+      await probeDuration(ffprobe.path, resolve(cwd, shot.videoPath), opts.signal);
     }
   }
 
@@ -360,7 +513,16 @@ export async function runRender(opts: {
         'render: shots dir escapes',
       );
     }
-    const fingerprint = specFingerprint(specRaw, resolved);
+    if (spec.assembly?.type === 'timeline') {
+      const assemblyDir = join(jobDir, 'assembly');
+      await mkdir(assemblyDir, { recursive: true });
+      if (!(await realpath(assemblyDir)).startsWith(`${realJobDir}${sep}`))
+        throw new VideoGenError(
+          'Timeline assembly directory escapes the render job.',
+          'render: assembly escape',
+        );
+    }
+    const fingerprint = specFingerprint(specRaw, generated.length ? resolved : undefined);
     let manifest = loadRenderJob(jobDir);
 
     if (manifest) {
@@ -410,6 +572,217 @@ export async function runRender(opts: {
             'render: frame drift',
           );
         }
+      }
+      if (manifest.state === 'done') {
+        if (!manifest.finalVideoHash || !manifest.finalVideoPath) {
+          throw new VideoGenError(
+            'Old completed render has no trustworthy final video hash. Compose its saved clips in a new job directory.',
+            'render: legacy final unverifiable',
+          );
+        }
+        const expectedFinal = join(
+          jobDir,
+          ...(spec.assembly ? ['assembly', 'final_video.mp4'] : ['final_video.mp4']),
+        );
+        if (manifest.finalVideoPath !== expectedFinal)
+          throw new VideoGenError(
+            'Completed render points to an unexpected final video path.',
+            'render: final path drift',
+          );
+        const finalStat = await lstat(expectedFinal).catch(() => null);
+        if (
+          !finalStat?.isFile() ||
+          finalStat.isSymbolicLink() ||
+          !(await realpath(expectedFinal)).startsWith(`${realJobDir}${sep}`)
+        )
+          throw new VideoGenError(
+            'Completed final video is not a regular file inside the job.',
+            'render: final file escape',
+          );
+        const actual = await hashFileSha256(manifest.finalVideoPath).catch(() => null);
+        if (!actual || actual !== manifest.finalVideoHash) {
+          throw new VideoGenError(
+            'Final video is missing or its hash changed. Refusing to reuse or silently rebuild it.',
+            'render: final video drift',
+          );
+        }
+        for (const [rel, expected] of Object.entries(manifest.qcHashes ?? {})) {
+          const qcPath = join(jobDir, rel);
+          const qcStat = await lstat(qcPath).catch(() => null);
+          if (
+            !qcStat?.isFile() ||
+            qcStat.isSymbolicLink() ||
+            !(await realpath(qcPath)).startsWith(`${realJobDir}${sep}`)
+          )
+            throw new VideoGenError(
+              `QC artifact ${rel} is not a regular file inside the job.`,
+              'render: qc escape',
+            );
+          const qc = await hashFileSha256(qcPath).catch(() => null);
+          if (!qc || qc !== expected)
+            throw new VideoGenError(
+              `QC artifact ${rel} changed or is missing.`,
+              'render: qc drift',
+            );
+        }
+      }
+      for (const shot of spec.shots) {
+        const state = manifest.shots[shot.id];
+        const storedVideo = join(realShotsDir, shot.id, 'video.mp4');
+        if (state?.state === 'done') {
+          const videoStat = await lstat(storedVideo).catch(() => null);
+          if (
+            (!videoStat && (shot.videoPath || manifest.state === 'done')) ||
+            (videoStat &&
+              (!videoStat.isFile() ||
+                videoStat.isSymbolicLink() ||
+                !(await realpath(storedVideo)).startsWith(`${realJobDir}${sep}`)))
+          )
+            throw new VideoGenError(
+              `Shot "${shot.id}" video snapshot is missing or escapes the job.`,
+              'render: shot video escape',
+            );
+        }
+        if (shot.videoPath) {
+          if (state?.source !== 'local')
+            throw new VideoGenError(
+              `Shot "${shot.id}" has no verified local source in the manifest.`,
+              'render: local manifest drift',
+            );
+          const source = await hashFileSha256(resolve(cwd, shot.videoPath)).catch(() => null);
+          const snap = await hashFileSha256(join(realShotsDir, shot.id, 'video.mp4')).catch(
+            () => null,
+          );
+          if (!source || !snap || source !== state.localSourceHash || snap !== state.videoHash) {
+            throw new VideoGenError(
+              `Local shot "${shot.id}" changed or its snapshot is missing. Start a new job.`,
+              'render: local shot drift',
+            );
+          }
+        } else if (state?.source === 'local') {
+          throw new VideoGenError(
+            `Generated shot "${shot.id}" cannot use a local-only manifest entry.`,
+            'render: generated source drift',
+          );
+        } else if (state?.state === 'done' && state.videoHash) {
+          const snap = await hashFileSha256(join(realShotsDir, shot.id, 'video.mp4')).catch(
+            () => null,
+          );
+          if (snap && snap !== state.videoHash)
+            throw new VideoGenError(
+              `Generated shot "${shot.id}" changed on disk.`,
+              'render: generated shot drift',
+            );
+        }
+      }
+      const frozenAssemblyAssets = assemblySources(spec, cwd);
+      if (
+        spec.assembly &&
+        (!manifest.assemblyAssetHashes ||
+          !sameKeys(Object.keys(manifest.assemblyAssetHashes), Object.keys(frozenAssemblyAssets)))
+      )
+        throw new VideoGenError(
+          'Assembly asset identities are missing from the render manifest.',
+          'render: assembly assets missing',
+        );
+      for (const [id, path] of Object.entries(frozenAssemblyAssets)) {
+        if ((await hashFileSha256(path).catch(() => null)) !== manifest.assemblyAssetHashes?.[id])
+          throw new VideoGenError(
+            `Assembly asset "${id}" changed since the paid input was frozen.`,
+            'render: assembly asset drift',
+          );
+      }
+      if (spec.assembly?.type === 'remotion') {
+        if (!manifest.assemblyProjectHash || !opts.trusted)
+          throw new VideoGenError(
+            'Remotion assembly has no frozen trusted project identity.',
+            'render: assembly identity',
+          );
+        const childSpec = readJsonFile<unknown>(join(jobDir, 'assembly', 'remotion-input.json'));
+        if (!childSpec || JSON.stringify(childSpec) !== JSON.stringify(spec.assembly))
+          throw new VideoGenError(
+            'Remotion assembly input changed since the paid script was frozen.',
+            'render: child spec drift',
+          );
+        const current = await runRemotion({
+          specPath: join(jobDir, 'assembly', 'remotion-input.json'),
+          cwd,
+          settings,
+          activeJobs: opts.activeJobs,
+          trusted: true,
+          preflight: true,
+          ffmpegPath: opts.ffmpegPath,
+        });
+        if (current.projectHash !== manifest.assemblyProjectHash)
+          throw new VideoGenError(
+            'Remotion project changed since paid generation; use a new job.',
+            'render: assembly drift',
+          );
+      }
+      if (manifest.state === 'done') {
+        if (spec.assembly?.type === 'remotion') {
+          const assets = {
+            ...spec.assembly.assets,
+            ...Object.fromEntries(
+              spec.shots.map((shot) => [shot.id, join(realShotsDir, shot.id, 'video.mp4')]),
+            ),
+          };
+          await runRemotion({
+            specPath: join(jobDir, 'assembly', 'remotion-input.json'),
+            cwd,
+            settings,
+            activeJobs: opts.activeJobs,
+            trusted: Boolean(opts.trusted),
+            frozenProjectHash: manifest.assemblyProjectHash,
+            assets,
+            ffmpegPath: opts.ffmpegPath,
+            verifyOnly: true,
+          });
+        }
+        if (spec.assembly) {
+          if (spec.assembly.type === 'timeline')
+            await runTimeline({
+              timelineSpecPath: join(jobDir, 'assembly', 'timeline-input.json'),
+              cwd: await realpath(cwd),
+              settings,
+              activeJobs: opts.activeJobs,
+              signal: opts.signal,
+            });
+          const childPath =
+            spec.assembly.type === 'remotion'
+              ? join(jobDir, 'assembly', 'remotion-manifest.json')
+              : join(jobDir, 'assembly', 'manifest.json');
+          const child = readJsonFile<{
+            kind?: string;
+            state?: string;
+            finalVideoPath?: string;
+            finalVideoHash?: string;
+          }>(childPath);
+          if (
+            !child ||
+            child.finalVideoPath !== manifest.finalVideoPath ||
+            child.finalVideoHash !== manifest.finalVideoHash ||
+            (spec.assembly.type === 'timeline' && child.state !== 'done')
+          )
+            throw new VideoGenError(
+              'Assembly child manifest does not match the completed render. Refusing to reuse.',
+              'render: child manifest drift',
+            );
+        }
+        return {
+          jobId,
+          finalVideoPath: manifest.finalVideoPath!,
+          shotsDone: spec.shots.length,
+          degraded,
+          qcFrames: Object.keys(manifest.qcHashes ?? {})
+            .filter((name) => name.endsWith('.png'))
+            .map((name) => join(jobDir, name)),
+          qcReportPath: manifest.qcHashes?.[join('qc', 'report.json')]
+            ? join(jobDir, 'qc', 'report.json')
+            : undefined,
+          editableProjectDir:
+            spec.assembly?.type === 'remotion' ? spec.assembly.projectDir : undefined,
+        };
       }
       opts.onUpdate?.(`Resuming job ${jobId} (fingerprint verified).`);
     } else {
@@ -510,15 +883,131 @@ export async function runRender(opts: {
         assets: { ...existingAssets, ...assets },
         updatedAt: new Date().toISOString(),
       });
+      const assemblyAssetHashes: Record<string, string> = {};
+      for (const [id, path] of Object.entries(assemblySources(spec, cwd))) {
+        if (!(await stat(path).catch(() => null))?.isFile())
+          throw new VideoGenError(
+            `Assembly asset "${id}" is missing.`,
+            'render: assembly asset missing',
+          );
+        if (opts.verifyMedia !== false && /\.(mp4|mov|webm|m4v)$/i.test(path)) {
+          const ffprobe = resolveFfprobe(settings.ffmpegPath);
+          if (!ffprobe.runnable)
+            throw new VideoGenError(
+              'ffprobe is required to validate existing assembly video.',
+              'render: ffprobe missing',
+            );
+          await probeStreams(ffprobe.path, path, opts.signal);
+          await probeDuration(ffprobe.path, path, opts.signal);
+        }
+        assemblyAssetHashes[id] = await hashFileSha256(path);
+      }
+      let assemblyProjectHash: string | undefined;
+      if (spec.assembly?.type === 'remotion') {
+        if (!opts.trusted)
+          throw new VideoGenError(
+            'Remotion assembly requires a trusted project.',
+            'render: untrusted assembly',
+          );
+        const assets = {
+          ...spec.assembly.assets,
+          ...Object.fromEntries(
+            spec.shots.map((shot) => [
+              shot.id,
+              shot.videoPath
+                ? resolve(cwd, shot.videoPath)
+                : join(realShotsDir, shot.id, 'video.mp4'),
+            ]),
+          ),
+        };
+        assemblyProjectHash = await preflightRemotion({
+          spec: spec.assembly as RemotionSpec,
+          cwd,
+          jobDir,
+          outputDir,
+          assets,
+          shotIds: spec.shots.map((shot) => shot.id),
+          ffmpegPath: opts.ffmpegPath,
+          signal: opts.signal,
+        });
+        writeJsonAtomic(join(jobDir, 'assembly', 'remotion-input.json'), spec.assembly);
+      }
+      if (spec.assembly?.type === 'timeline') {
+        const timelineInput = spec.assembly.timeline;
+        const mapped = timelineWithShotPaths(timelineInput, realShotsDir);
+        assertNarrationOptIn(parseTimelineSpec(JSON.stringify(mapped)));
+        if (opts.verifyMedia !== false) {
+          if (!resolveFfprobe(settings.ffmpegPath).runnable)
+            throw new VideoGenError(
+              'Timeline assembly needs ffprobe before model submission.',
+              'render: timeline ffprobe missing',
+            );
+          if (
+            timelineInput.output?.codec === 'h264' &&
+            !resolveGplFfmpeg(settings.ffmpegPath).runnable
+          )
+            throw new VideoGenError(
+              'H.264 timeline assembly needs an ffmpeg build with libx264.',
+              'render: timeline encoder missing',
+            );
+          const visibleText = timelineInput.segments
+            .map(
+              (segment) =>
+                `${segment.overlay?.title ?? ''}${segment.overlay?.subtitle ?? ''}${timelineInput.subtitles?.mode === 'burn' ? (segment.narration ?? '') : ''}`,
+            )
+            .join('');
+          if (/\p{Script=Han}/u.test(visibleText) && !hasCjkFont())
+            throw new VideoGenError(
+              'Timeline assembly needs a CJK font for its text overlays.',
+              'render: timeline CJK font missing',
+            );
+        }
+      }
       manifest = {
         jobId,
         kind: 'render',
         state: 'rendering',
         specFingerprint: fingerprint,
         frameHashes,
+        assemblyProjectHash,
+        assemblyAssetHashes: spec.assembly ? assemblyAssetHashes : undefined,
         shots: Object.fromEntries(spec.shots.map((s) => [s.id, { state: 'pending' as const }])),
         updatedAt: new Date().toISOString(),
       };
+      for (const shot of spec.shots) {
+        if (!shot.videoPath) continue;
+        const sourcePath = resolve(cwd, shot.videoPath);
+        const sourceStat = await stat(sourcePath).catch(() => null);
+        if (!sourceStat?.isFile() || sourceStat.size === 0)
+          throw new VideoGenError(
+            `Local shot "${shot.id}" is not a readable video file.`,
+            'render: local source invalid',
+          );
+        const videoPath = join(realShotsDir, shot.id, 'video.mp4');
+        const existing = await lstat(videoPath).catch(() => null);
+        if (existing && !existing.isFile())
+          throw new VideoGenError(
+            `Local shot "${shot.id}" snapshot path is not a regular file.`,
+            'render: local destination invalid',
+          );
+        const temp = `${videoPath}.tmp-${randomUUID()}`;
+        await copyFile(sourcePath, temp, COPYFILE_EXCL);
+        await rename(temp, videoPath);
+        const localSourceHash = await hashFileSha256(sourcePath);
+        const videoHash = await hashFileSha256(videoPath);
+        if (localSourceHash !== videoHash)
+          throw new VideoGenError(
+            `Local shot "${shot.id}" changed while being copied. Start a new job.`,
+            'render: source race',
+          );
+        manifest.shots[shot.id] = {
+          state: 'done',
+          source: 'local',
+          videoPath,
+          localSourceHash,
+          videoHash,
+        };
+      }
       saveRenderJob(jobDir, manifest);
     }
 
@@ -527,6 +1016,7 @@ export async function runRender(opts: {
     const renderShot = async (shot: RenderShotInput): Promise<void> => {
       const shotState = manifest!.shots[shot.id]!;
       const videoPath = join(realShotsDir, shot.id, 'video.mp4');
+      if (shot.videoPath) return;
       if (shotState.state === 'done' && existsSync(videoPath)) return;
 
       const firstSnap = shot.firstFramePath
@@ -537,17 +1027,17 @@ export async function runRender(opts: {
         : undefined;
       const attempt = shotState.attempt ?? 1;
       const params: GenerateVideoParams = {
-        prompt: assemblePrompt(spec, shot.prompt),
+        prompt: assemblePrompt(spec, shot.prompt!),
         requestId: `${jobId}:${shot.id}:${attempt}`,
         firstFramePath: firstSnap,
         lastFramePath: lastSnap,
         referenceAssets: shot.referenceAssets,
-        durationSec: shot.durationSec ?? resolved.entry.defaultDurationSec,
-        aspectRatio: spec.aspectRatio ?? resolved.entry.defaultAspectRatio,
-        resolution: resolved.entry.defaultResolution,
-        generateAudio: caps.nativeAudio,
+        durationSec: shot.durationSec ?? resolved!.entry.defaultDurationSec,
+        aspectRatio: spec.aspectRatio ?? resolved!.entry.defaultAspectRatio,
+        resolution: resolved!.entry.defaultResolution,
+        generateAudio: caps!.nativeAudio,
       };
-      let activeFingerprint = requestFingerprint(resolved.remoteId, params);
+      let activeFingerprint = requestFingerprint(resolved!.remoteId, params);
 
       // A previously ambiguous submit must NEVER auto-resubmit: a paid task
       // may exist. Block the whole run until the user resolves it through the
@@ -574,7 +1064,7 @@ export async function runRender(opts: {
       if (!handle) {
         currentAttempt = (currentAttempt ?? 0) + 1;
         params.requestId = `${jobId}:${shot.id}:${currentAttempt}`;
-        const submittedFingerprint = requestFingerprint(resolved.remoteId, params);
+        const submittedFingerprint = requestFingerprint(resolved!.remoteId, params);
         activeFingerprint = submittedFingerprint;
         await opts.rateLimiter.acquire(opts.signal);
         opts.onUpdate?.(`Shot ${shot.id}: submitting…`);
@@ -587,9 +1077,9 @@ export async function runRender(opts: {
         };
         saveRenderJob(jobDir, manifest!);
         try {
-          handle = await adapter.submit(
-            resolved.provider,
-            resolved.remoteId,
+          handle = await adapter!.submit(
+            resolved!.provider,
+            resolved!.remoteId,
             params,
             fetch,
             opts.signal,
@@ -615,7 +1105,7 @@ export async function runRender(opts: {
 
       opts.onUpdate?.(`Shot ${shot.id}: polling task ${handle.taskId}…`);
       const succeeded = await pollTask({
-        check: () => adapter.inspect(resolved.provider, handle!, fetch, opts.signal),
+        check: () => adapter!.inspect(resolved!.provider, handle!, fetch, opts.signal),
         signal: opts.signal,
       }).catch((error: unknown) => {
         if (error instanceof RemoteTaskNotFoundError) {
@@ -644,20 +1134,27 @@ export async function runRender(opts: {
         throw error;
       });
       opts.onUpdate?.(`Shot ${shot.id}: downloading…`);
-      await adapter.downloadTo(
-        resolved.provider,
+      await adapter!.downloadTo(
+        resolved!.provider,
         handle,
         succeeded.videoUrl,
         videoPath,
         fetch,
         opts.signal,
       );
+      const videoHash = await hashFileSha256(videoPath);
+      if (shotState.state === 'done' && shotState.videoHash && videoHash !== shotState.videoHash)
+        throw new VideoGenError(
+          `Recovered video for shot "${shot.id}" does not match its previously frozen hash.`,
+          'render: recovered shot drift',
+        );
       manifest!.shots[shot.id] = {
         state: 'done',
         attempt: currentAttempt,
         handle,
         requestFingerprint: shotState.requestFingerprint ?? activeFingerprint,
         videoPath,
+        videoHash,
       };
       saveRenderJob(jobDir, manifest!);
       opts.onUpdate?.(`Shot ${shot.id}: done.`);
@@ -671,7 +1168,7 @@ export async function runRender(opts: {
         for (const [shotId, shotState] of Object.entries(manifest.shots)) {
           if (!shotState.handle || shotState.state === 'done') continue;
           let cancelled = false;
-          if (adapter.cancel) {
+          if (adapter?.cancel && resolved) {
             try {
               cancelled = (
                 await adapter.cancel(
@@ -709,18 +1206,84 @@ export async function runRender(opts: {
     }
 
     // 5. concat
+    const shotMedia: {
+      id: string;
+      durationSec: number;
+      videoCodec: string;
+      audioLayout: string;
+    }[] = [];
+    if (opts.verifyMedia !== false) {
+      const ffprobe = resolveFfprobe(settings.ffmpegPath);
+      if (!ffprobe.runnable)
+        throw new VideoGenError(
+          'ffprobe is required to verify downloaded shot media.',
+          'render: ffprobe missing',
+        );
+      for (const shot of spec.shots) {
+        const path = join(realShotsDir, shot.id, 'video.mp4');
+        const streams = await probeStreams(ffprobe.path, path, opts.signal);
+        const durationSec = await probeDuration(ffprobe.path, path, opts.signal);
+        shotMedia.push({
+          id: shot.id,
+          durationSec,
+          videoCodec: streams.videoCodec,
+          audioLayout: streams.audioLayout,
+        });
+      }
+    }
     manifest.state = 'concatenating';
     saveRenderJob(jobDir, manifest);
     const inputs = spec.shots.map((s) => join(realShotsDir, s.id, 'video.mp4'));
-    const finalVideoPath = join(jobDir, 'final_video.mp4');
-    opts.onUpdate?.(`Concatenating ${inputs.length} clips…`);
+    let finalVideoPath = join(jobDir, 'final_video.mp4');
+    let remotionShotTimes: Record<string, number> | undefined;
+    opts.onUpdate?.(`Assembling ${inputs.length} clips…`);
     try {
-      await concat({
-        inputs,
-        outputPath: finalVideoPath,
-        ffmpegPath: opts.ffmpegPath,
-        signal: opts.signal,
-      });
+      if (spec.assembly?.type === 'remotion') {
+        const assets = {
+          ...spec.assembly.assets,
+          ...Object.fromEntries(spec.shots.map((shot, index) => [shot.id, inputs[index]!])),
+        };
+        const child = await runRemotion({
+          specPath: join(jobDir, 'assembly', 'remotion-input.json'),
+          cwd,
+          settings,
+          activeJobs: opts.activeJobs,
+          trusted: Boolean(opts.trusted),
+          frozenProjectHash: manifest.assemblyProjectHash,
+          assets,
+          shotIds: spec.shots.map((shot) => shot.id),
+          ffmpegPath: opts.ffmpegPath,
+          signal: opts.signal,
+        });
+        finalVideoPath = child.finalVideoPath;
+        remotionShotTimes = child.shotTimesSec;
+      } else if (spec.assembly?.type === 'timeline') {
+        const assemblyDir = join(jobDir, 'assembly');
+        await mkdir(assemblyDir, { recursive: true });
+        if (!(await realpath(assemblyDir)).startsWith(`${realJobDir}${sep}`))
+          throw new VideoGenError(
+            'Timeline assembly directory escapes the render job.',
+            'render: assembly escape',
+          );
+        const timeline = timelineWithShotPaths(spec.assembly.timeline, realShotsDir);
+        const timelinePath = join(assemblyDir, 'timeline-input.json');
+        writeJsonAtomic(timelinePath, timeline);
+        const child = await runTimeline({
+          timelineSpecPath: timelinePath,
+          cwd: await realpath(cwd),
+          settings,
+          activeJobs: opts.activeJobs,
+          signal: opts.signal,
+        });
+        finalVideoPath = child.finalVideoPath;
+      } else {
+        await concat({
+          inputs,
+          outputPath: finalVideoPath,
+          ffmpegPath: opts.ffmpegPath,
+          signal: opts.signal,
+        });
+      }
     } catch (error) {
       const cancelled = error instanceof CancelledError || opts.signal?.aborted;
       saveRenderJob(jobDir, {
@@ -731,10 +1294,127 @@ export async function runRender(opts: {
       throw error;
     }
 
+    if (opts.verifyMedia !== false) {
+      const ffprobe = resolveFfprobe(settings.ffmpegPath);
+      const finalStreams = await probeStreams(ffprobe.path, finalVideoPath, opts.signal);
+      const finalDurationSec = await probeDuration(ffprobe.path, finalVideoPath, opts.signal);
+      if (
+        !spec.assembly &&
+        Math.abs(finalDurationSec - shotMedia.reduce((sum, item) => sum + item.durationSec, 0)) > 1
+      )
+        throw new VideoGenError(
+          'QC: final duration differs from the sum of shot durations by more than 1s.',
+          'render: duration qc',
+        );
+      if (
+        !spec.assembly &&
+        shotMedia.some((item) => item.audioLayout !== 'none') &&
+        finalStreams.audioLayout === 'none'
+      )
+        throw new VideoGenError('QC: final video lost the source audio track.', 'render: audio qc');
+      const qcDir = join(jobDir, 'qc');
+      await mkdir(qcDir, { recursive: true });
+      const realQc = await realpath(qcDir);
+      if (!realQc.startsWith(`${realJobDir}${sep}`))
+        throw new VideoGenError('QC directory escapes the render job.', 'render: qc escape');
+      const qcHashes: Record<string, string> = {};
+      const finalSamples: { timeSec: number; path: string }[] = [];
+      if (spec.assembly?.type === 'timeline') {
+        const child = loadTimelineJob(join(jobDir, 'assembly'));
+        if (!child || child.state !== 'done')
+          throw new VideoGenError(
+            'Timeline assembly has no completed manifest.',
+            'render: timeline qc',
+          );
+        let cursor = 0;
+        for (const [index, segment] of spec.assembly.timeline.segments.entries()) {
+          const duration = child.segments[segment.id]?.resolvedDurationSec;
+          const visible = (duration ?? 0) - (segment.transitionTo?.durationSec ?? 0);
+          if (!Number.isFinite(visible) || visible <= 0)
+            throw new VideoGenError(
+              `Timeline segment ${segment.id} has no valid duration.`,
+              'render: timeline qc',
+            );
+          finalSamples.push({
+            timeSec: cursor + visible / 2,
+            path: join('qc', `final_part_${index + 1}.png`),
+          });
+          cursor += visible;
+        }
+      } else if (spec.assembly?.type === 'remotion') {
+        for (const [index, shot] of spec.shots.entries()) {
+          const timeSec = remotionShotTimes?.[shot.id];
+          if (
+            timeSec === undefined ||
+            !Number.isFinite(timeSec) ||
+            timeSec < 0 ||
+            timeSec >= finalDurationSec
+          )
+            throw new VideoGenError(
+              `Remotion has no valid timing for shot ${shot.id}.`,
+              'render: remotion qc',
+            );
+          finalSamples.push({ timeSec, path: join('qc', `final_part_${index + 1}.png`) });
+        }
+      } else {
+        let cursor = 0;
+        for (const [index, shot] of shotMedia.entries()) {
+          finalSamples.push({
+            timeSec: cursor + shot.durationSec / 2,
+            path: join('qc', `final_part_${index + 1}.png`),
+          });
+          cursor += shot.durationSec;
+        }
+      }
+      const samples = [
+        ...shotMedia.map((shot) => ({
+          timeSec: shot.durationSec / 2,
+          path: join('qc', `shot_${shot.id}.png`),
+          video: join(realShotsDir, shot.id, 'video.mp4'),
+        })),
+        ...finalSamples.map((sample) => ({ ...sample, video: finalVideoPath })),
+      ];
+      for (const { timeSec, path: rel, video } of samples) {
+        const dest = join(jobDir, rel);
+        const temp = `${dest}.${randomUUID()}.png`;
+        await runFfmpegCommand(
+          opts.ffmpegPath,
+          ['-ss', timeSec.toFixed(3), '-i', video, '-frames:v', '1', '-n', temp],
+          opts.signal,
+        );
+        await rename(temp, dest);
+        qcHashes[rel] = await hashFileSha256(dest, opts.signal);
+      }
+      const reportPath = join(qcDir, 'report.json');
+      writeJsonAtomic(reportPath, {
+        shots: shotMedia,
+        final: {
+          durationSec: finalDurationSec,
+          videoCodec: finalStreams.videoCodec,
+          audioLayout: finalStreams.audioLayout,
+          samples: finalSamples,
+        },
+      });
+      qcHashes[join('qc', 'report.json')] = await hashFileSha256(reportPath, opts.signal);
+      manifest.qcHashes = qcHashes;
+    }
     manifest.state = 'done';
     manifest.finalVideoPath = finalVideoPath;
+    manifest.finalVideoHash = await hashFileSha256(finalVideoPath);
     saveRenderJob(jobDir, manifest);
-    return { jobId, finalVideoPath, shotsDone: spec.shots.length, degraded };
+    return {
+      jobId,
+      finalVideoPath,
+      shotsDone: spec.shots.length,
+      degraded,
+      qcFrames: Object.keys(manifest.qcHashes ?? {})
+        .filter((name) => name.endsWith('.png'))
+        .map((name) => join(jobDir, name)),
+      qcReportPath: manifest.qcHashes?.[join('qc', 'report.json')]
+        ? join(jobDir, 'qc', 'report.json')
+        : undefined,
+      editableProjectDir: spec.assembly?.type === 'remotion' ? spec.assembly.projectDir : undefined,
+    };
   } finally {
     release();
   }
