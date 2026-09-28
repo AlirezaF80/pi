@@ -220,6 +220,7 @@ export function selectIntegrationMatrix(changedFiles, { forceAll = false } = {})
     if (testedExtensions.has(packageName)) selected.add(packageName);
     if (file.startsWith('tests/computer-use-')) selected.add('pi-computer-use');
     if (file.startsWith('.github/scripts/telemetry-')) selected.add('pi-telemetry');
+    if (file === '.github/scripts/pi-memory-snapshot-e2e.mjs') selected.add('pi-memory');
   }
   return fullMatrix.filter((entry) => selected.has(entry.extension));
 }

@@ -2,7 +2,7 @@
 
 ![pi-memory preview](https://raw.githubusercontent.com/TGYD-helige/pi/master/packages/pi-memory/preview.png)
 
-Persistent curated memory for pi agents — `MEMORY.md` (the agent's own notes) and `USER.md` (what the agent knows about the user). The extension initializes storage at session start, then reloads both files before each agent run and injects a sanitized snapshot into that run's system prompt. Writes are durable on disk immediately; they are visible through `memory_read` right away and appear in the prompt snapshot on the next agent run.
+Persistent curated memory for pi agents — `MEMORY.md` (the agent's own notes) and `USER.md` (what the agent knows about the user). The extension loads both files at session start and injects a sanitized snapshot into the system prompt. Writes are durable on disk immediately and visible through `memory_read` right away; the system-prompt snapshot refreshes after successful context compaction or in a new session.
 
 Modeled after hermes' default `MemoryStore` mechanism (no provider/manager abstraction).
 
@@ -53,12 +53,13 @@ When installed as a dependency with the `pi.extensions` field declared in `packa
 
 ```
 pi.extensions → session_start → initialize store → register tools
-              → before_agent_start → reload MEMORY.md/USER.md → append snapshot to systemPrompt
+              → before_agent_start → append frozen snapshot to systemPrompt
+              → session_compact → reload MEMORY.md/USER.md for the next agent run
               → session_shutdown → release
 ```
 
 - **Storage**: `<agentDir>/memories/MEMORY.md` and `<agentDir>/memories/USER.md`
-- **Lifecycle**: initialize on `session_start`, rebuild the prompt snapshot before each agent run
+- **Lifecycle**: capture a fresh system-prompt snapshot for new and forked sessions, restore it on resume or reload, and refresh it after successful compaction
 - **Status command**: `/memory status` shows entry counts per file
 - **LLM tools**: `memory_add`, `memory_replace`, `memory_remove`, `memory_read`
 
@@ -92,7 +93,7 @@ await store.loadFromDisk();
 // ToolDefinition[] — wire into your tool registry directly
 const tools = createMemoryTools(store);
 
-// System prompt fragment (rebuilt by loadFromDisk; call it before each agent run)
+// System prompt fragment (rebuilt by loadFromDisk; freeze it for the session)
 const promptBlock = store.formatAllForSystemPrompt();
 ```
 
@@ -118,18 +119,22 @@ The drift guard exists to prevent silent data loss — never bypass it by deleti
 
 ## Prompt snapshot
 
-`loadFromDisk()` refreshes live entries from disk and rebuilds the sanitized system-prompt block. The extension calls it before each agent run. Subsequent `add` / `replace` / `remove` calls update **live state** and disk, but not the snapshot already attached to the current agent run. Why:
+`loadFromDisk()` refreshes live entries from disk and rebuilds the sanitized system-prompt block. A new or forked session captures that block and persists it in the Pi session; resume and reload restore a saved block after validating it again. Invalid saved blocks fall back to a newly sanitized disk snapshot. The same bytes are reused across agent runs until successful context compaction, while session-tree navigation selects the snapshot saved on that branch. Subsequent `add` / `replace` / `remove` calls update **live state** and disk, but not the frozen prompt snapshot. Why:
 
-- The system prompt is the prefix-cache key for a model call. Mutating it mid-run invalidates the prefix and makes the model's context harder to reason about.
+- Reusing the same system prompt preserves the provider's prefix-cache opportunity across agent runs in the session.
 - Tool responses always reflect live state, so the model still sees its own writes — just via tool-result tail, not system-prompt head.
-- The prompt snapshot picks up changes on the **next** `before_agent_start` / `loadFromDisk()`.
+- The prompt snapshot picks up changes after successful `session_compact` or in a new session. A changed snapshot can still cause a cache miss at that boundary.
+
+The extension bounds very large prompt snapshots when capturing them and reserves space for both files when both are present; the memory files and tool reads retain their full content.
 
 ## Lifecycle reference
 
 | Hook                  | Behavior                                                                  |
 |-----------------------|---------------------------------------------------------------------------|
-| `session_start`       | Resolve `dataDir`, build `MemoryStore`, `loadFromDisk()`, register 4 tools, set status `memory: loaded`/`memory: empty`, and start a gated background dream. |
-| `before_agent_start`  | Reload memory from disk, rebuild the prompt snapshot, and append it to assembled `systemPrompt` (guidance only when empty). |
+| `session_start`       | Resolve `dataDir`, build `MemoryStore`, `loadFromDisk()`, capture a fresh snapshot for new/forked sessions or restore the saved one, register 4 tools, set status `memory: loaded`/`memory: empty`, and start a gated background dream. |
+| `before_agent_start`  | Append the frozen snapshot to assembled `systemPrompt` (guidance only when empty). |
+| `session_compact`     | Reload memory from disk and persist a changed snapshot for the next agent run. |
+| `session_tree`        | Select the snapshot saved on the newly active branch. |
 | `session_shutdown`    | Drop store references.                                                    |
 
 ## Dreaming (Background Memory Consolidation)

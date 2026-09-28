@@ -160,6 +160,10 @@ test('routes companion packages and package-specific integration tests', () => {
     selectIntegrationMatrix(['packages/pi-memory-mem0/src/index.ts']).map(({ extension }) => extension),
     ['pi-memory', 'pi-memory-mem0'],
   );
+  assert.deepEqual(
+    selectIntegrationMatrix(['.github/scripts/pi-memory-snapshot-e2e.mjs']).map(({ extension }) => extension),
+    ['pi-memory'],
+  );
   for (const file of ['tests/computer-use-owner-exit.mjs', 'tests/computer-use-driver-e2e.mjs']) {
     assert.deepEqual(
       selectIntegrationMatrix([file]).map(({ extension, scenario }) => [extension, scenario]),

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { isProjectTrusted, loadPiSettings, resolveHome } from '@amaster.ai/pi-shared/settings';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   createExtractionRunner,
   type ExtractionModelConfig,
@@ -9,10 +9,51 @@ import {
 import { type DreamingConfig, runDream } from './dream.js';
 import { MEMORY_GUIDANCE } from './guidance.js';
 import { MemoryStore } from './store.js';
+import { scanForThreats } from './threat-patterns.js';
 import { createMemoryTools } from './tools.js';
 
 const SETTINGS_KEY = 'pi-memory';
 const STATUS_KEY = 'pi-memory';
+const SNAPSHOT_ENTRY = 'pi-memory:system-prompt-snapshot';
+const MAX_SNAPSHOT_CHARS = 50_000;
+
+function captureSnapshot(store: MemoryStore): string {
+  const memory = store.formatForSystemPrompt('memory');
+  const user = store.formatForSystemPrompt('user');
+  if (!memory) return user.slice(0, MAX_SNAPSHOT_CHARS);
+  if (!user) return memory.slice(0, MAX_SNAPSHOT_CHARS);
+  const reservedForUser = Math.min(user.length, MAX_SNAPSHOT_CHARS / 2 - 1);
+  const memoryPart = memory.slice(0, MAX_SNAPSHOT_CHARS - 2 - reservedForUser);
+  return `${memoryPart}\n\n${user.slice(0, MAX_SNAPSHOT_CHARS - 2 - memoryPart.length)}`;
+}
+
+function savedSnapshot(ctx: ExtensionContext): string | undefined {
+  const sessionId = ctx.sessionManager.getSessionId();
+  const isSnapshot = (entry: { type: string; customType?: string; data?: unknown }) => {
+    const data = entry.data;
+    return (
+      entry.type === 'custom' &&
+      entry.customType === SNAPSHOT_ENTRY &&
+      typeof data === 'object' &&
+      data !== null &&
+      'sessionId' in data &&
+      data.sessionId === sessionId &&
+      'snapshot' in data &&
+      typeof data.snapshot === 'string'
+    );
+  };
+  const saved =
+    ctx.sessionManager.getBranch().findLast(isSnapshot) ??
+    ctx.sessionManager.getEntries().find(isSnapshot);
+  const data = saved?.type === 'custom' ? saved.data : undefined;
+  if (!data || typeof data !== 'object' || !('snapshot' in data)) return undefined;
+  const snapshot = data.snapshot;
+  return typeof snapshot === 'string' &&
+    snapshot.length <= MAX_SNAPSHOT_CHARS &&
+    scanForThreats(snapshot, 'strict').length === 0
+    ? snapshot
+    : undefined;
+}
 
 export type PiMemoryExtensionConfig = {
   /** Directory containing MEMORY.md / USER.md. Default: `<agentDir>/memories`. */
@@ -72,8 +113,10 @@ export default function memoryExtension(
 ): void {
   let store: MemoryStore | undefined;
   let extractionRunner: ExtractionRunner | undefined;
+  let systemPromptSnapshot = '';
 
   pi.on('session_start', async (_event, ctx) => {
+    systemPromptSnapshot = '';
     const fileConfig = loadSettings(ctx.cwd, isProjectTrusted(ctx));
     const config = resolveConfig({ ...fileConfig, ...injectedConfig });
 
@@ -87,9 +130,16 @@ export default function memoryExtension(
         store = new MemoryStore(opts);
       }
       await store.loadFromDisk();
-      const snapshot = store.formatAllForSystemPrompt();
+      const snapshot = captureSnapshot(store);
+      const saved = savedSnapshot(ctx);
+      if (saved !== undefined) {
+        systemPromptSnapshot = saved;
+      } else {
+        systemPromptSnapshot = snapshot;
+        pi.appendEntry(SNAPSHOT_ENTRY, { sessionId: ctx.sessionManager.getSessionId(), snapshot });
+      }
 
-      ctx.ui.setStatus(STATUS_KEY, snapshot ? 'memory: loaded' : 'memory: empty');
+      ctx.ui.setStatus(STATUS_KEY, systemPromptSnapshot ? 'memory: loaded' : 'memory: empty');
 
       for (const tool of createMemoryTools(store)) {
         pi.registerTool(tool);
@@ -132,24 +182,38 @@ export default function memoryExtension(
     extractionRunner.onTurnEnd(event as never);
   });
 
-  pi.on('before_agent_start', async (event) => {
-    if (store) {
-      await store.loadFromDisk();
-    }
-    const snapshot = store?.formatAllForSystemPrompt() ?? '';
-    const block = [event.systemPrompt?.includes(MEMORY_GUIDANCE) ? '' : MEMORY_GUIDANCE, snapshot]
+  pi.on('before_agent_start', (event) => {
+    const block = [
+      event.systemPrompt?.includes(MEMORY_GUIDANCE) ? '' : MEMORY_GUIDANCE,
+      systemPromptSnapshot,
+    ]
       .filter(Boolean)
       .join('\n\n');
     if (!block) return;
-    return {
-      systemPrompt: event.systemPrompt ? `${event.systemPrompt}\n\n${block}` : block,
-    };
+    return { systemPrompt: event.systemPrompt ? `${event.systemPrompt}\n\n${block}` : block };
+  });
+
+  pi.on('session_compact', async (_event, ctx) => {
+    if (!store) return;
+    await store.loadFromDisk();
+    const snapshot = captureSnapshot(store);
+    if (snapshot === systemPromptSnapshot) return;
+    pi.appendEntry(SNAPSHOT_ENTRY, { sessionId: ctx.sessionManager.getSessionId(), snapshot });
+    systemPromptSnapshot = snapshot;
+    ctx.ui.setStatus(STATUS_KEY, snapshot ? 'memory: loaded' : 'memory: empty');
+  });
+
+  pi.on('session_tree', (_event, ctx) => {
+    if (!store) return;
+    systemPromptSnapshot = savedSnapshot(ctx) ?? captureSnapshot(store);
+    ctx.ui.setStatus(STATUS_KEY, systemPromptSnapshot ? 'memory: loaded' : 'memory: empty');
   });
 
   pi.on('session_shutdown', async () => {
     extractionRunner?.shutdown();
     extractionRunner = undefined;
     store = undefined;
+    systemPromptSnapshot = '';
   });
 
   pi.registerCommand('memory', {
