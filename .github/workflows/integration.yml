@@ -632,6 +632,10 @@ jobs:
           fi
           pi list
 
+      - name: Verify pi-memory system snapshot across session resume and fork
+        if: matrix.extension == 'pi-memory'
+        run: node .github/scripts/pi-memory-snapshot-e2e.mjs
+
       - name: Verify computer-use daemon follows abrupt owner exit
         if: matrix.extension == 'pi-computer-use' && runner.os == 'Linux'
         run: |
