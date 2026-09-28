@@ -1,6 +1,6 @@
 # pi-video-gen
 
-Pi extension for agentic video generation. Ships the single-clip primitive (`video_generate`), the multi-shot render pipeline (`video_render`), local lossless clip composing and mixed-media promo timelines with overlays, TTS, soft or burned subtitles, source-video audio, and BGM (`video_compose`), the read-only `video_capabilities` query, a `/video-gen` command, and the `video-gen` skill that orchestrates the full shot-book workflow together with [pi-image-gen](../pi-image-gen) (all image work).
+Pi extension for video creation. `video_generate` calls a video model directly for one clip; `video_compose` assembles existing media by lossless concat, FFmpeg timeline or a trusted Remotion project; `video_render` executes a prepared batch script with generated and existing shots, persistent remote-task recovery and optional assembly. The `video-gen` skill explains how to choose per shot. `video_capabilities` and `/video-gen` provide model information and direct commands.
 
 ## Providers
 
@@ -95,9 +95,9 @@ Global settings (`~/.pi/agent/settings.json`):
 
 | Tool | What it does |
 |---|---|
-| `video_compose` | **Local video assembly, no paid video models.** C0 (`compose-input.json`) concatenates compatible clips. Timeline media, overlays, transitions, subtitles, source audio, and BGM render locally. Narration is an explicit network feature: setting `voice` to `edge-tts:<voice-name>` sends narration text to Microsoft Edge TTS. |
+| `video_compose` | **Local video assembly, no paid video models.** `compose-input.json` concatenates compatible clips; `timeline-input.json` renders FFmpeg media, overlays, transitions and subtitles; `remotion-input.json` renders a trusted editable Remotion project. Narration with `edge-tts:<voice-name>` sends text to Microsoft Edge TTS. |
 | `video_generate` | One short clip from a structured prompt plus optional first/last frames or current-account trusted `referenceAssets`. Paid, minutes per clip. Interrupted after receiving a task id? Resume with the returned `jobId`; an ambiguous submit is parked and never resubmitted automatically. |
-| `video_render` | Multi-shot film from `<jobDir>/render-input.json`: every shot requires a local first frame or at least one trusted asset; snapshots + hashes local frames, submits one paid task per shot (resume-aware, finished shots never re-bill), downloads clips, ffmpeg-concats into `final_video.mp4`. |
+| `video_render` | Executes `<jobDir>/render-input.json`: each shot uses either `videoPath` or a generated prompt with a first frame/trusted asset. Only generated shots need a model and API key. The default assembly concatenates; optional `assembly` selects FFmpeg timeline or Remotion. Paid handles, local snapshots, final SHA-256 and QC hashes support safe recovery. |
 | `video_capabilities` | Read-only: active model's capability table, trusted asset modalities, and registered models. Call before composing prompts or shot books. |
 
 ## Structured prompts
@@ -134,19 +134,17 @@ Both paid tools take structured prompt fields, never a pre-joined string. The pl
 | `/video-gen reload` | Reload settings |
 | `/video-gen doctor` | Environment check (key, ffmpeg+ffprobe, libx264, CJK fonts, `image_generate`, output dir, trust) |
 
-## The shot-book workflow (multi-shot films)
+## Choosing the path
 
-Driven by the `video-gen` skill in conversation:
+Choose the source for each shot: reuse existing video, call `video_generate` directly for a missing model clip, or draw precise text/UI/chart animation in Remotion. Use `video_render` when a prepared batch needs automation and reliable recovery. A shot book, character portraits and first/last frames are optional creative aids. See [the skill](skills/video-gen/SKILL.md), [render script examples](skills/video-gen/references/video-render-workflow.md) and [Remotion handoff](skills/video-gen/references/remotion-handoff.md).
 
-1. **Shot book** — the agent authors a shot book (characters + shots with
-   first/last-frame descriptions, visuals+action, effects, audio, continuity)
-   and you review it in chat. Default small: 1 scene, 3–5 shots.
-2. **Sources** — the agent uses current-account trusted portrait assets when
-   Seedance will receive recognizable real people; otherwise it generates
-   character portraits and per-shot frames via `image_generate`, tracking local
-   returned paths in `assets.json`.
-3. **Render** — after explicit confirmation, ONE `video_render` call pays for
-   and stitches everything.
+`video_compose` accepts `<jobDir>/remotion-input.json` with absolute `projectDir`, `compositionId`, optional `entryPoint`, `assets`, `inputProps` and `browserExecutable`. The project must be in a trusted working directory and have local Remotion dependencies plus Chrome/Chromium installed. Original `public/` files are copied with their relative paths; injected assets are available through `inputProps.videoGenAssets` and `staticFile()`. `video_render` uses the same contract under `assembly.type: "remotion"`; it preflights the project with placeholders before any model submit. The plugin does not install Remotion or download a browser during a render.
+
+For Remotion batch rendering, the composition must expose `props.videoGenShotTimesSec` with one in-film sample time (seconds) per shot ID. It may be set through `defaultProps` or computed by `calculateMetadata` from the actual assets. The placeholder preflight checks that every shot has a valid time before paid submission; the final QC uses the values returned by the rendered composition. Default concat and FFmpeg timeline QC use actual clip or resolved segment durations instead.
+
+Keep Remotion source files and imports outside the video output directory; that directory is excluded from the frozen project fingerprint so other jobs cannot invalidate paid work. The entry point is rejected if it is inside the output directory, and the output directory cannot be inside the project's `public/` tree.
+
+Remotion is installed by the local project rather than distributed with this package. Review [Remotion's license FAQ](https://www.remotion.dev/docs/license/faq) for the project's usage and organization before deploying an automated rendering service.
 
 ## Jobs on disk
 
@@ -154,11 +152,14 @@ Driven by the `video-gen` skill in conversation:
 <cwd>/.video-gen/<jobId>/
 ├── render-input.json   # immutable spec (revisions = new job dir)
 ├── assets.json         # semantic assets ↔ image_generate's real returned paths
-├── manifest.json       # state + per-shot remote handles + frame SHA-256 (atomic, single writer)
-├── shots/<shotId>/first_frame.png|last_frame.png|video.mp4  # frames optional for asset-only shots
-└── final_video.mp4
+├── manifest.json       # state + per-shot remote handles/local hashes + final SHA-256
+├── shots/<shotId>/first_frame.png|last_frame.png|video.mp4
+├── qc/shot_<shotId>.png # one frame per source shot with content hashes
+├── qc/final_part_<n>.png # samples from the assembled MP4
+├── assembly/            # separate child job for timeline or Remotion mode
+└── final_video.mp4      # default concat mode; assembly modes return assembly/final_video.mp4
 ```
 
-Crash or cancel mid-render? Rerun the same spec path — the input fingerprint (spec + frame hashes + model/provider) is verified, then persisted handles resume via `inspect` without re-billing. NOTE: cancelling stops local polling only; the remote task may keep running and billable (Ark cancellation support is unverified). If submit completion is ambiguous, rerun is blocked until `/video-gen recover <jobId>` explicitly resets or adopts the affected shot. Single-clip ambiguous submits are also persisted and blocked; check the provider console before starting another generation. Single-job resume independently recomputes the request fingerprint from its frozen `input.json`; an inspect 404 keeps the remote handle and parks the job as ambiguous instead of declaring it safe to resubmit.
+Crash or cancel mid-render? Rerun the same spec path — generated-shot handles resume via `inspect` without re-billing, and local shots are checked against frozen content hashes. Completed jobs verify their final MP4 and QC hashes instead of recomposing. All-local jobs omit the model/provider from their fingerprint and need no API key. A legacy `done` render manifest without a saved final SHA-256 cannot verify its old film; create a new compose job from the saved clips. Cancelling stops local polling only; remote tasks may keep running and billable. If submit completion is ambiguous, use `/video-gen recover <jobId>` after checking the provider console.
 
 **Upgrading from the pre-structured format**: render jobs whose `render-input.json` still uses the old `videoPrompt` string can no longer be parsed or resumed (the structured `prompt` object replaced it deliberately, with no compatibility layer). If an in-flight paid task is stranded by the upgrade, download its clip manually from the provider console — task URLs expire (Ark: 24h). Single-clip jobs are unaffected: their frozen `input.json` is read, not re-parsed.

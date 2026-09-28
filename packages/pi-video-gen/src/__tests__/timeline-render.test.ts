@@ -313,6 +313,17 @@ describe('timeline pipeline (C1–C4)', () => {
     expect(stats.channels[0]!.max).toBeGreaterThan(0);
   });
 
+  it('reports titles that cannot fit the safe frame after wrapping', async () => {
+    await expect(
+      renderTextOverlay({
+        overlay: { title: 'UNBREAKABLE'.repeat(30), position: 'center' },
+        width: 640,
+        height: 360,
+        outPath: join(cwd, 'too-long.png'),
+      }),
+    ).rejects.toThrow(/safe frame|safe.*width/i);
+  });
+
   it('keeps title and subtitle on separate text rows', async () => {
     const out = join(cwd, 'separate-lines.png');
     await renderTextOverlay({
@@ -658,7 +669,9 @@ describe('timeline pipeline (C1–C4)', () => {
     expect(existsSync(result.finalVideoPath)).toBe(true);
     expect(result.subtitlePath && existsSync(result.subtitlePath)).toBe(true);
     expect(readFileSync(result.subtitlePath!, 'utf-8')).toContain('第一段旁白内容');
-    expect(result.qcFrames).toHaveLength(3);
+    expect(result.qcFrames).toHaveLength(8);
+    expect(result.qcFrames.some((path) => path.includes('qc_segment_'))).toBe(true);
+    expect(result.qcFrames.some((path) => path.includes('qc_transition_'))).toBe(true);
     for (const f of result.qcFrames) expect(existsSync(f)).toBe(true);
 
     // artifacts cached: overlays, audio, segments
@@ -698,6 +711,78 @@ describe('timeline pipeline (C1–C4)', () => {
     const result = await runTimeline({ timelineSpecPath: specPath, ...baseOpts(cwd) });
 
     expect(markerMaxAcceleration(result.finalVideoPath)).toBeLessThan(0.5);
+  });
+
+  it('uses real sentence boundaries for soft subtitles', async () => {
+    const image = await makeImage(cwd, 'sentences.png', { r: 40, g: 40, b: 40 });
+    const jobDir = join(cwd, '.video-gen', 'sentences');
+    mkdirSync(jobDir, { recursive: true });
+    const specPath = join(jobDir, 'timeline-input.json');
+    writeFileSync(
+      specPath,
+      JSON.stringify({
+        output: { resolution: '640x360', fps: 25 },
+        segments: [{ id: 's1', image, durationSec: 3, narration: 'Hello. World.' }],
+      }),
+    );
+    const timedTts: TtsProvider = {
+      name: 'timed',
+      async synthesize(opts) {
+        await fakeTts.synthesize(opts);
+        return {
+          audioPath: opts.outPath,
+          sentenceTimings: [
+            { text: 'Hello.', startSec: 0.1, endSec: 0.8 },
+            { text: 'World.', startSec: 1.1, endSec: 1.8 },
+          ],
+        };
+      },
+    };
+    const result = await runTimeline({
+      ...baseOpts(cwd),
+      timelineSpecPath: specPath,
+      tts: timedTts,
+    });
+    const srt = readFileSync(result.subtitlePath!, 'utf8');
+    expect(srt).toContain('00:00:00,100 --> 00:00:00,800');
+    expect(srt).toContain('00:00:01,100 --> 00:00:01,800');
+    expect(srt.match(/-->/g) ?? []).toHaveLength(2);
+  });
+
+  it('renders one burned caption per real sentence boundary', async () => {
+    const image = await makeImage(cwd, 'burn-sentences.png', { r: 255, g: 255, b: 255 });
+    const jobDir = join(cwd, '.video-gen', 'burn-sentences');
+    mkdirSync(jobDir, { recursive: true });
+    const specPath = join(jobDir, 'timeline-input.json');
+    writeFileSync(
+      specPath,
+      JSON.stringify({
+        output: { resolution: '640x360', fps: 25 },
+        subtitles: { mode: 'burn' },
+        segments: [{ id: 's1', image, durationSec: 3, narration: 'One. Two.' }],
+      }),
+    );
+    const timedTts: TtsProvider = {
+      name: 'timed',
+      async synthesize(opts) {
+        await fakeTts.synthesize(opts);
+        return {
+          audioPath: opts.outPath,
+          sentenceTimings: [
+            { text: 'One.', startSec: 0, endSec: 0.8 },
+            { text: 'Two.', startSec: 1, endSec: 1.8 },
+          ],
+        };
+      },
+    };
+    const result = await runTimeline({
+      ...baseOpts(cwd),
+      timelineSpecPath: specPath,
+      tts: timedTts,
+    });
+    expect(existsSync(result.finalVideoPath)).toBe(true);
+    expect(existsSync(join(jobDir, 'overlays', 'subtitle-s1-0.png'))).toBe(true);
+    expect(existsSync(join(jobDir, 'overlays', 'subtitle-s1-1.png'))).toBe(true);
   });
 
   it('mixes a trimmed video segment and its source audio into the timeline', async () => {
@@ -1705,7 +1790,7 @@ describe('timeline pipeline (C1–C4)', () => {
 
     const result = await runTimeline({ timelineSpecPath: specPath, ...baseOpts(cwd) });
 
-    expect(result.qcFrames).toHaveLength(3);
+    expect(result.qcFrames).toHaveLength(4);
     for (const frame of result.qcFrames) expect(existsSync(frame)).toBe(true);
   });
 

@@ -27,6 +27,7 @@ import {
   RemoteTaskNotFoundError,
   redactUrl,
   toLogSummary,
+  VideoGenError,
 } from './errors.js';
 import { resolveFfmpeg, resolveFfprobe, resolveGplFfmpeg } from './ffmpeg.js';
 import { readApprovedFrame } from './frame-input.js';
@@ -58,7 +59,8 @@ import {
   requestFingerprint,
 } from './providers/request.js';
 import { CancelledError, pollTask, RateLimiter } from './providers/task.js';
-import { runRender } from './render.js';
+import { runRemotion } from './remotion.js';
+import { parseRenderSpec, runRender } from './render.js';
 import { hasCjkFont } from './text-layer.js';
 import { runTimeline } from './timeline-render.js';
 import type {
@@ -794,6 +796,31 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
           result as unknown as Record<string, unknown>,
         );
       }
+      if (name === 'remotion-input.json') {
+        const ffmpeg = resolveFfmpeg(settings.ffmpegPath);
+        if (!ffmpeg.runnable)
+          return errResult(
+            'ffmpeg is required for Remotion media validation. Run /video-gen doctor.',
+          );
+        const result = await runRemotion({
+          specPath: p.composeSpecPath,
+          cwd: ctx.cwd,
+          settings,
+          activeJobs,
+          trusted: isProjectTrusted(ctx),
+          ffmpegPath: ffmpeg.path,
+          signal,
+        });
+        pi.appendEntry('video-gen:last-job', {
+          jobId: result.jobId,
+          kind: 'remotion',
+          finalVideoPath: result.finalVideoPath,
+        });
+        return okResult(
+          `Remotion video ready: ${result.finalVideoPath}. Editable project: ${result.projectDir}. Job: ${result.jobId}.`,
+          result as unknown as Record<string, unknown>,
+        );
+      }
       // C0: lossless concat of existing clips.
       const result = await runCompose({
         composeSpecPath: p.composeSpecPath,
@@ -826,19 +853,27 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
     onUpdate?: (partial: TextResult) => void,
   ): Promise<TextResult> => {
     try {
-      const resolved = resolveModel(settings);
-      if (!resolved) {
+      const specRaw = await readFile(resolve(ctx.cwd, p.renderSpecPath), 'utf-8').catch(() => {
+        throw new VideoGenError(
+          'Render spec not readable. Expected <jobDir>/render-input.json.',
+          'render: spec unreadable',
+        );
+      });
+      const spec = parseRenderSpec(specRaw);
+      const needsModel = spec.shots.some((shot) => !shot.videoPath);
+      const resolved = needsModel ? (resolveModel(settings) ?? undefined) : undefined;
+      if (needsModel && !resolved) {
         return errResult(
           `Cannot resolve model "${settings.defaultModel ?? DEFAULT_VIDEO_MODEL_ID}". Run /video-gen models, or fix pi-video-gen.defaultModel.`,
         );
       }
-      const adapter = ADAPTERS[resolved.provider.style];
-      if (!adapter) {
+      const adapter = resolved ? ADAPTERS[resolved.provider.style] : undefined;
+      if (needsModel && !adapter) {
         return errResult(
-          `Provider adapter "${resolved.provider.style}" is unavailable in this build. Run /video-gen models or reinstall pi-video-gen.`,
+          `Provider adapter "${resolved!.provider.style}" is unavailable in this build. Run /video-gen models or reinstall pi-video-gen.`,
         );
       }
-      if (!resolved.provider.apiKey) {
+      if (resolved && !resolved.provider.apiKey) {
         return errResult(
           missingKeyError(
             resolved.provider.style,
@@ -863,6 +898,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
         activeJobs,
         rateLimiter,
         ffmpegPath: ffmpeg.path,
+        trusted: isProjectTrusted(ctx),
         signal,
         onUpdate: (msg) => onUpdate?.(okResult(msg)),
       });
@@ -874,7 +910,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
         finalVideoPath: result.finalVideoPath,
       });
       return okResult(
-        `Final video ready: ${result.finalVideoPath} (${result.shotsDone} shots). Job: ${result.jobId}.${degradedNote}`,
+        `Final video ready: ${result.finalVideoPath} (${result.shotsDone} shots). QC: ${result.qcReportPath ?? 'not recorded'}; frames: ${result.qcFrames.join(', ') || 'not recorded'}.${result.editableProjectDir ? ` Editable project: ${result.editableProjectDir}.` : ''} Job: ${result.jobId}.${degradedNote}`,
         result as unknown as Record<string, unknown>,
       );
     } catch (error) {
@@ -919,7 +955,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
       name: 'video_generate',
       label: 'Generate Video Clip',
       description:
-        'Generate a single short video clip (one shot) from a structured prompt, optionally anchored by first/last frames or provider-managed trusted assets. Paid, slow (minutes per clip). For multi-shot videos, use the video-gen skill workflow instead of calling this repeatedly.',
+        'Generate one video-model clip directly from a structured prompt and optional frames or trusted assets. Paid and slow. Repeat directly when hands-on control is useful; use video_render only for a prepared batch with recovery.',
       parameters: buildGenerateParams(schemaCaps),
       promptSnippet:
         'Generate one short video clip (paid, minutes) from a structured prompt via the active video model',
@@ -947,18 +983,18 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
       name: 'video_compose',
       label: 'Compose Video Clips',
       description:
-        'Local video assembly, no paid models. Two specs: <jobDir>/compose-input.json (C0: lossless concat of 2+ existing mp4 clips, ffprobe stream precheck) or <jobDir>/timeline-input.json (C1+: promo from mixed images/video clips + overlays + TTS + transitions + soft or burned subtitles, rendered locally).',
+        'Compose existing media locally: lossless concat (compose-input.json), FFmpeg timeline (timeline-input.json), or a trusted Remotion project (remotion-input.json). No video-model calls; timeline narration may use network TTS.',
       parameters: Type.Object({
         composeSpecPath: Type.String({
           description:
-            'Path to <jobDir>/compose-input.json (C0) or <jobDir>/timeline-input.json (promo timeline). The parent directory must live under the video-gen output dir and acts as the job. Rerunning the same path resumes identical input; revisions require a NEW job directory.',
+            'Path to <jobDir>/compose-input.json, timeline-input.json, or remotion-input.json. The parent directory is the immutable job under the video-gen output directory.',
         }),
       }),
       promptSnippet:
-        'Assemble video locally — lossless clip concat (C0) or a mixed image/video promo timeline with TTS and soft/burned subtitles, no paid models',
+        'Compose existing assets locally by concat, FFmpeg timeline, or a trusted Remotion project; no paid video model',
       promptGuidelines: [
         'Read the video-gen skill and follow its concat or timeline workflow before writing the spec. Local composition skips video_capabilities and paid-model gates.',
-        'Two modes: <jobDir>/compose-input.json (C0: concat 2+ compatible mp4 clips) or <jobDir>/timeline-input.json (promo: mixed images/video + overlays + TTS + xfade + soft/burned subtitles). Rendering is local; optional narration sends text to Microsoft Edge TTS.',
+        'Choose compose-input.json for lossless concat, timeline-input.json for FFmpeg overlays and narration, or remotion-input.json for precise graphics and an editable React project. Remotion requires a trusted local project and installed Remotion/Chrome; optional narration sends text to Microsoft Edge TTS.',
         'For C0: every ordered stream across all clips must match (codec/resolution/fps/timebase/pix_fmt/sample-rate/audio layout) — mismatches are reported via ffprobe, never silently transcoded. Do NOT use for AI video generation (use video_generate/video_render).',
         'For timeline: each segment contains exactly one image or video. Video uses numeric durationSec with optional trimStartSec, fit, and sourceAudio; image may use auto duration and motion.',
         'Reuse existing images/screenshots/clips first and generate only missing visuals with image_generate. Put Chinese titles in overlay and use subtitles.mode "burn" when narration subtitles must appear directly in the frames.',
@@ -976,7 +1012,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
       name: 'video_render',
       label: 'Render Multi-Shot Video',
       description:
-        'Render a multi-shot video from <jobDir>/render-input.json: each shot requires a local first frame or at least one provider-managed trusted asset. Submits one paid task per shot (resuming persisted handles on rerun), downloads clips, and concatenates them into final_video.mp4.',
+        'Execute a prepared render-input.json with generated and existing video shots. Only generated shots call a paid model; resume persisted tasks and assemble by concat, FFmpeg timeline, or Remotion.',
       parameters: Type.Object({
         renderSpecPath: Type.String({
           description:
@@ -989,9 +1025,10 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
         ),
       }),
       promptSnippet:
-        'Render a prepared multi-shot video spec (paid, long-running) into a final mp4',
+        'Execute a prepared multi-shot script with existing or paid generated clips and resumable assembly',
       promptGuidelines: [
-        'Read the video-gen skill and follow its multi-shot workflow. Call ONLY after the user explicitly confirmed rendering: exact local frames/trusted assets ready, shot count, durations, provider/account context, and cost magnitude stated.',
+        'Read the video-gen skill. Use video_render for a prepared batch needing automation or recovery. Paid approval applies only to generated shots; all-local scripts need no model key or paid confirmation.',
+        'Each shot chooses videoPath for existing media or prompt plus firstFramePath/referenceAssets for generation. Optional assembly selects timeline or Remotion; Remotion is preflighted before the first model submit.',
         'For each shot, either generate required local frames via image_generate and record their returned paths, or pass current-account provider assets in referenceAssets. Recognizable real-person references sent to Seedance must use preset-avatar or authorized-person assets.',
         'render-input.json carries structured prompts: film-level style/characters/consistency/negative, per-shot prompt.{scene,visuals,action,effects,audio,visibleCharacters} — the plugin assembles the labeled prompt text; never pre-join a prompt string.',
         'The spec is immutable per job directory: rerunning the same path resumes identical input; revisions go in a NEW job directory.',
@@ -1124,7 +1161,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
         const specPath = (args ?? '').trim().slice('compose'.length).trim();
         if (!specPath) {
           ctx.ui.notify(
-            'Usage: /video-gen compose <jobDir/compose-input.json|timeline-input.json>',
+            'Usage: /video-gen compose <jobDir/compose-input.json|timeline-input.json|remotion-input.json>',
             'error',
           );
           return;
@@ -1306,7 +1343,7 @@ export default function piVideoGenExtension(pi: ExtensionAPI): void {
       }
 
       ctx.ui.notify(
-        'pi-video-gen commands:\n  /video-gen generate --visuals ".." --action ".." [--style ".." --scene ".."]  Generate a single clip\n  /video-gen render <spec>      Render a multi-shot video\n  /video-gen compose <spec>     Concat clips or render an image/TTS timeline\n  /video-gen recover <jobId>    Resolve ambiguous shots (reset/adopt)\n  /video-gen models             List registered models\n  /video-gen reload             Reload settings\n  /video-gen doctor             Check environment (ffmpeg, CJK fonts, keys, image_generate, output dir)',
+        'pi-video-gen commands:\n  /video-gen generate --visuals ".." --action ".." [--style ".." --scene ".."]  Generate one model clip\n  /video-gen render <spec>      Run a mixed-shot script with recovery\n  /video-gen compose <spec>     Concat, FFmpeg timeline, or Remotion project\n  /video-gen recover <jobId>    Resolve ambiguous shots (reset/adopt)\n  /video-gen models             List registered models\n  /video-gen reload             Reload settings\n  /video-gen doctor             Check environment (ffmpeg, CJK fonts, keys, image_generate, output dir)',
         'info',
       );
     },

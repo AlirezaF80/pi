@@ -37,6 +37,7 @@ import {
   type Motion,
   parseTimelineSpec,
   type TimelineSegment,
+  type TimelineSpec,
   timelineSourcePath,
 } from './timeline.js';
 import { edgeTtsProvider, parseVoiceRef, type TtsProvider } from './tts/edge-tts.js';
@@ -63,6 +64,18 @@ export type TimelineRunResult = {
   subtitlePath?: string | undefined;
   qcFrames: string[];
 };
+
+export function assertNarrationOptIn(spec: TimelineSpec, hasInjectedTts = false): void {
+  if (
+    spec.segments.some((segment) => Boolean(segment.narration)) &&
+    !hasInjectedTts &&
+    !spec.voice?.startsWith('edge-tts:')
+  )
+    throw new VideoGenError(
+      'Narration requires explicit Edge TTS opt-in. Set voice to "edge-tts:<voice-name>"; narration text will be sent to Microsoft.',
+      'timeline: edge tts not opted in',
+    );
+}
 
 const AUTO_PAD_SEC = 0.6;
 
@@ -366,16 +379,7 @@ export async function runTimeline(opts: {
 
   const specRaw = await readFile(realSpecPath);
   const spec = parseTimelineSpec(specRaw.toString('utf-8'));
-  if (
-    spec.segments.some((segment) => Boolean(segment.narration)) &&
-    !opts.tts &&
-    !spec.voice?.startsWith('edge-tts:')
-  ) {
-    throw new VideoGenError(
-      'Narration requires explicit Edge TTS opt-in. Set voice to "edge-tts:<voice-name>"; narration text will be sent to Microsoft.',
-      'timeline: edge tts not opted in',
-    );
-  }
+  assertNarrationOptIn(spec, Boolean(opts.tts));
   const width = Number((spec.output?.resolution ?? '1920x1080').split('x')[0]);
   const height = Number((spec.output?.resolution ?? '1920x1080').split('x')[1]);
   const fps = spec.output?.fps ?? 25;
@@ -597,7 +601,7 @@ export async function runTimeline(opts: {
     type ResolvedSegment = TimelineSegment & {
       resolvedDurationSec: number;
       overlayPath?: string;
-      burnedSubtitlePath?: string;
+      burnedSubtitles?: { path: string; startSec: number; endSec: number }[];
       narrationPath?: string;
       narrationDurationSec?: number;
       sourceDurationSec?: number;
@@ -632,25 +636,6 @@ export async function runTimeline(opts: {
         out.overlayPath = overlayPath;
       }
 
-      if (seg.narration && spec.subtitles?.mode === 'burn') {
-        const narration = seg.narration;
-        const burnedSubtitlePath = join(overlaysDir, `subtitle-${seg.id}.png`);
-        if (!(await canReuse(burnedSubtitlePath))) {
-          opts.onUpdate?.(`Rendering burned subtitle for ${seg.id}…`);
-          await writeAtomic(burnedSubtitlePath, async (tmp) => {
-            await renderBurnedSubtitle({
-              text: narration,
-              style: spec.subtitles!,
-              width,
-              height,
-              outPath: tmp,
-            });
-          });
-          await record(burnedSubtitlePath);
-        }
-        out.burnedSubtitlePath = burnedSubtitlePath;
-      }
-
       // narration via TTS
       if (seg.narration) {
         const narrationPath = join(audioDir, `${seg.id}.mp3`);
@@ -662,12 +647,23 @@ export async function runTimeline(opts: {
         } else if (!hasNarrationArtifact) {
           try {
             opts.onUpdate?.(`Synthesizing narration for ${seg.id} (${voice})…`);
-            await tts.synthesize({
+            const ttsResult = await tts.synthesize({
               text: seg.narration,
               voice,
               outPath: narrationPath,
               signal: opts.signal,
             });
+            manifest.segments[seg.id] = {
+              ...manifest.segments[seg.id],
+              sentenceTimings: ttsResult.sentenceTimings?.filter(
+                (cue) =>
+                  cue.text.trim() &&
+                  Number.isFinite(cue.startSec) &&
+                  Number.isFinite(cue.endSec) &&
+                  cue.startSec >= 0 &&
+                  cue.endSec > cue.startSec,
+              ),
+            };
             hasNarrationArtifact = true;
             narrationNeedsCommit = true;
           } catch (error) {
@@ -735,15 +731,36 @@ export async function runTimeline(opts: {
           'timeline: video trim exceeds source',
         );
       }
-      // Post-resolution revalidation: a transition longer than the resolved
-      // duration would swallow the segment (and the LAST segment must not
-      // have one at all — there is nothing after it).
-      const isLast = resolved.length === spec.segments.length - 1;
-      if (seg.transitionTo && (isLast || seg.transitionTo.durationSec >= out.resolvedDurationSec)) {
+      if (seg.narration && spec.subtitles?.mode === 'burn') {
+        const visibleSpan = out.resolvedDurationSec - transitionOverlap(seg);
+        const timed = manifest.segments[seg.id]?.sentenceTimings;
+        const cues = timed?.length
+          ? timed
+          : [{ text: seg.narration, startSec: 0, endSec: out.narrationDurationSec ?? visibleSpan }];
+        out.burnedSubtitles = [];
+        for (const [index, cue] of cues.entries()) {
+          const endSec = Math.min(cue.endSec, visibleSpan);
+          if (endSec <= cue.startSec) continue;
+          const path = join(overlaysDir, `subtitle-${seg.id}-${index}.png`);
+          if (!(await canReuse(path))) {
+            await writeAtomic(path, async (tmp) => {
+              await renderBurnedSubtitle({
+                text: cue.text,
+                style: spec.subtitles!,
+                width,
+                height,
+                outPath: tmp,
+              });
+            });
+            await record(path);
+          }
+          out.burnedSubtitles.push({ path, startSec: cue.startSec, endSec });
+        }
+      }
+      // Post-resolution revalidation: the resolved duration may differ from the declared duration.
+      if (seg.transitionTo && seg.transitionTo.durationSec >= out.resolvedDurationSec) {
         throw new VideoGenError(
-          isLast
-            ? `Segment "${seg.id}": the LAST segment must not have a transitionTo — there is nothing after it.`
-            : `Segment "${seg.id}": transitionTo.durationSec (${seg.transitionTo.durationSec}s) must be shorter than the resolved duration (${out.resolvedDurationSec.toFixed(1)}s).`,
+          `Segment "${seg.id}": transitionTo.durationSec (${seg.transitionTo.durationSec}s) must be shorter than the resolved duration (${out.resolvedDurationSec.toFixed(1)}s).`,
           'timeline: transition invalid',
         );
       }
@@ -811,17 +828,17 @@ export async function runTimeline(opts: {
         `[0:v]${motion}${seg.video ? `,fps=${fps}` : ''},format=yuv420p[base]`,
       ];
       let currentLayer = 'base';
-      for (const [index, overlayPath] of [seg.overlayPath, seg.burnedSubtitlePath]
-        .filter((path): path is string => Boolean(path))
-        .entries()) {
+      const overlays = [
+        ...(seg.overlayPath ? [{ path: seg.overlayPath }] : []),
+        ...(seg.burnedSubtitles ?? []),
+      ];
+      for (const [index, overlay] of overlays.entries()) {
+        const overlayPath = overlay.path;
         const inputIndex = inputs.filter((arg) => arg === '-i').length;
         inputs.push('-i', overlayPath);
         const enable =
-          overlayPath === seg.burnedSubtitlePath
-            ? `:enable='lt(t,${Math.min(
-                seg.resolvedDurationSec - transitionOverlap(seg),
-                seg.narrationDurationSec ?? Number.POSITIVE_INFINITY,
-              ).toFixed(3)})'`
+          'startSec' in overlay
+            ? `:enable='between(t,${overlay.startSec.toFixed(3)},${overlay.endSec.toFixed(3)})'`
             : '';
         graphParts.push(
           `[${inputIndex}:v]format=rgba[ovr${index}]`,
@@ -1206,14 +1223,24 @@ export async function runTimeline(opts: {
         if (seg.narration) {
           const start = videoCursor;
           const visibleSpan = seg.resolvedDurationSec - transitionOverlap(seg);
-          const end = Math.min(
-            videoCursor + visibleSpan,
-            start + (seg.narrationDurationSec ?? visibleSpan),
-          );
-          cues.push(`${idx++}
-${srtTimestamp(start)} --> ${srtTimestamp(end)}
-${splitCueText(seg.narration)}
+          const timed = manifest.segments[seg.id]?.sentenceTimings;
+          const sentences = timed?.length
+            ? timed
+            : [
+                {
+                  text: seg.narration,
+                  startSec: 0,
+                  endSec: seg.narrationDurationSec ?? visibleSpan,
+                },
+              ];
+          for (const cue of sentences) {
+            const end = Math.min(start + visibleSpan, start + cue.endSec);
+            if (end <= start + cue.startSec) continue;
+            cues.push(`${idx++}
+${srtTimestamp(start + cue.startSec)} --> ${srtTimestamp(end)}
+${splitCueText(cue.text)}
 `);
+          }
         }
         videoCursor += seg.resolvedDurationSec - transitionOverlap(seg);
       }
@@ -1310,32 +1337,53 @@ ${splitCueText(seg.narration)}
       );
     }
 
-    const qcFrames: string[] = [];
-    const qcNames = ['qc_first.png', 'qc_mid.png', 'qc_last.png'] as const;
-    const qcReady = (await Promise.all(qcNames.map((name) => canReuse(join(qcDir, name))))).every(
+    const edgeOffset = Math.min(0.5, actualSec / 4);
+    const shots: [string, number][] = [
+      ['qc_first.png', edgeOffset],
+      ['qc_mid.png', actualSec / 2],
+      ['qc_last.png', actualSec - edgeOffset],
+    ];
+    let segmentCursor = 0;
+    for (const seg of resolved) {
+      const overlap = transitionOverlap(seg);
+      const visibleSpan = seg.resolvedDurationSec - overlap;
+      shots.push([`qc_segment_${seg.id}.png`, segmentCursor + visibleSpan / 2]);
+      if (overlap > 0) {
+        const boundary = segmentCursor + visibleSpan;
+        const delta = Math.min(0.15, overlap / 3);
+        shots.push([`qc_transition_${seg.id}_before.png`, boundary - delta]);
+        shots.push([`qc_transition_${seg.id}_after.png`, boundary + delta]);
+      }
+      segmentCursor += visibleSpan;
+    }
+    const qcReady = (await Promise.all(shots.map(([name]) => canReuse(join(qcDir, name))))).every(
       Boolean,
     );
     if (!qcReady) {
       opts.onUpdate?.('Extracting QC frames…');
-      const edgeOffset = Math.min(0.5, actualSec / 4);
-      const shots: [string, number][] = [
-        ['qc_first.png', edgeOffset],
-        ['qc_mid.png', actualSec / 2],
-        ['qc_last.png', actualSec - edgeOffset],
-      ];
       for (const [name, t] of shots) {
         const out = join(qcDir, name);
+        if (await canReuse(out)) continue;
         await writeAtomic(out, async (tmp) => {
           await runFfmpegCommand(
             ffmpeg.path,
-            ['-ss', t.toFixed(2), '-i', finalVideoPath, '-frames:v', '1', '-y', tmp],
+            [
+              '-ss',
+              Math.max(0, Math.min(actualSec - 0.02, t)).toFixed(2),
+              '-i',
+              finalVideoPath,
+              '-frames:v',
+              '1',
+              '-y',
+              tmp,
+            ],
             opts.signal,
           );
         });
         await record(out);
       }
     }
-    for (const name of qcNames) qcFrames.push(join(qcDir, name));
+    const qcFrames = shots.map(([name]) => join(qcDir, name));
 
     manifest.state = 'done';
     manifest.finalVideoPath = finalVideoPath;

@@ -879,6 +879,31 @@ describe('pi-video-gen extension', () => {
     }
   });
 
+  it('runs an all-local render without a model API key', async () => {
+    const { createRequire } = await import('node:module');
+    const { execFileSync } = await import('node:child_process');
+    const ffmpeg = createRequire(import.meta.url)('ffmpeg-static') as string;
+    const clip = join(cwd, 'local.mp4');
+    execFileSync(ffmpeg, ['-y', '-f', 'lavfi', '-i', 'color=blue:size=64x64', '-t', '1', clip]);
+    const jobDir = join(cwd, '.video-gen', 'local-job');
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(
+      join(jobDir, 'render-input.json'),
+      JSON.stringify({ shots: [{ id: 'local', videoPath: clip }] }),
+    );
+    const result = await tools
+      .get('video_render')!
+      .execute(
+        'local',
+        { renderSpecPath: join(jobDir, 'render-input.json') },
+        undefined,
+        undefined,
+        fakeCtx(cwd),
+      );
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toContain('Final video ready');
+  });
+
   it('/video-gen doctor reports ffmpeg by source, not internal absolute paths', async () => {
     const ctx = fakeCtx(cwd);
     await commands.get('video-gen')!.handler('doctor', ctx);
@@ -900,6 +925,13 @@ describe('pi-video-gen extension', () => {
       }),
     );
     await startSession(cwd);
+
+    const jobDir = join(cwd, '.video-gen', 'missing');
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(
+      join(jobDir, 'render-input.json'),
+      JSON.stringify({ shots: [{ id: 'local', videoPath: join(cwd, 'clip.mp4') }] }),
+    );
 
     const result = await tools
       .get('video_render')!

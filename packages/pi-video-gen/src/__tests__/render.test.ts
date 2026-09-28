@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -12,7 +13,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveModel } from '../config.js';
 import { httpStatusError } from '../errors.js';
-import { ActiveJobs, loadRenderJob, saveRenderJob } from '../jobs/store.js';
+import { resolveFfmpeg } from '../ffmpeg.js';
+import { ActiveJobs, loadRenderJob, loadTimelineJob, saveRenderJob } from '../jobs/store.js';
 import { BUILT_IN_VIDEO_MODELS } from '../providers/models.js';
 import { requestFingerprint } from '../providers/request.js';
 import { CancelledError, RateLimiter } from '../providers/task.js';
@@ -99,6 +101,7 @@ function baseOpts(
     activeJobs: new ActiveJobs(),
     rateLimiter: new RateLimiter(),
     ffmpegPath: 'unused-ffmpeg',
+    verifyMedia: false,
     concatImpl: (async ({ inputs, outputPath }: { inputs: string[]; outputPath: string }) => {
       concatCalls.inputs.push(inputs);
       writeFileSync(outputPath, fakeMp4());
@@ -117,6 +120,371 @@ describe('runRender', () => {
     mkdirSync(cwd, { recursive: true });
     calls = { submit: 0, download: 0, params: [] };
     concatCalls = { inputs: [] };
+  });
+
+  it('uses local shots without a model and reuses a verified final video', async () => {
+    const clip = join(cwd, 'existing.mp4');
+    writeFileSync(clip, fakeMp4());
+    const jobDir = makeJob(cwd, { shots: [{ id: 'existing', videoPath: clip }] });
+    const opts = baseOpts(cwd, mockAdapter(calls), concatCalls);
+    const localOpts = { ...opts, resolved: undefined, adapter: undefined };
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...localOpts });
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...localOpts });
+    await runRender({
+      renderSpecPath: join(jobDir, 'render-input.json'),
+      ...localOpts,
+      settings: { defaultModel: 'changed-default' },
+    });
+    expect(calls.submit).toBe(0);
+    expect(concatCalls.inputs).toHaveLength(1);
+    expect(loadRenderJob(jobDir)?.finalVideoHash).toMatch(/^[0-9a-f]{64}$/);
+    writeFileSync(join(jobDir, 'final_video.mp4'), 'changed');
+    await expect(
+      runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...localOpts }),
+    ).rejects.toThrow(/final video|成片|hash/i);
+  });
+
+  it('refuses a legacy completed manifest without adopting its final video hash', async () => {
+    const clip = join(cwd, 'existing.mp4');
+    writeFileSync(clip, fakeMp4());
+    const jobDir = makeJob(cwd, { shots: [{ id: 'existing', videoPath: clip }] });
+    const opts = {
+      ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      resolved: undefined,
+      adapter: undefined,
+    };
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    const old = loadRenderJob(jobDir)!;
+    old.finalVideoHash = undefined;
+    saveRenderJob(jobDir, old);
+    await expect(
+      runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts }),
+    ).rejects.toThrow(/no trustworthy final video hash/);
+    expect(concatCalls.inputs).toHaveLength(1);
+  });
+
+  it('does not accept a generated shot disguised as a local manifest entry', async () => {
+    const frame = makeFrame(cwd, 'generated.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        {
+          id: 'generated',
+          firstFramePath: frame,
+          prompt: { visuals: 'medium shot', action: 'moves' },
+        },
+      ],
+    });
+    const opts = baseOpts(cwd, mockAdapter(calls), concatCalls);
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    const manifest = loadRenderJob(jobDir)!;
+    manifest.shots.generated = {
+      state: 'done',
+      source: 'local',
+      localSourceHash: manifest.shots.generated!.videoHash!,
+      videoHash: manifest.shots.generated!.videoHash!,
+    };
+    saveRenderJob(jobDir, manifest);
+    await expect(
+      runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts }),
+    ).rejects.toThrow(/local-only manifest/);
+  });
+
+  it('resumes cancelled assembly without resubmitting completed model shots', async () => {
+    const frame = makeFrame(cwd, 'assembly.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+    });
+    const opts = baseOpts(cwd, mockAdapter(calls), concatCalls);
+    await expect(
+      runRender({
+        renderSpecPath: join(jobDir, 'render-input.json'),
+        ...opts,
+        concatImpl: (async () => {
+          throw new CancelledError();
+        }) as never,
+      }),
+    ).rejects.toThrow();
+    expect(calls.submit).toBe(1);
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    expect(calls.submit).toBe(1);
+    expect(concatCalls.inputs).toHaveLength(1);
+  });
+
+  it('redownloads a missing finished shot from its handle without paying again', async () => {
+    const frame = makeFrame(cwd, 'missing-download.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+    });
+    const opts = baseOpts(cwd, mockAdapter(calls), concatCalls);
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    const manifest = loadRenderJob(jobDir)!;
+    manifest.state = 'rendering';
+    manifest.finalVideoPath = undefined;
+    manifest.finalVideoHash = undefined;
+    saveRenderJob(jobDir, manifest);
+    rmSync(join(jobDir, 'shots', 's1', 'video.mp4'));
+    calls.submit = 0;
+    calls.download = 0;
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    expect(calls.submit).toBe(0);
+    expect(calls.download).toBe(1);
+  });
+
+  it('refuses a completed render whose generated shot snapshot is missing', async () => {
+    const frame = makeFrame(cwd, 'completed-missing.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+    });
+    const opts = baseOpts(cwd, mockAdapter(calls), concatCalls);
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    rmSync(join(jobDir, 'shots', 's1', 'video.mp4'));
+    await expect(
+      runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts }),
+    ).rejects.toThrow(/snapshot is missing/);
+    expect(calls.submit).toBe(1);
+    expect(concatCalls.inputs).toHaveLength(1);
+  });
+
+  it('rejects an escaping timeline assembly directory before paid submission', async () => {
+    const frame = makeFrame(cwd, 'timeline-escape.png');
+    const outside = join(cwd, 'outside');
+    mkdirSync(outside);
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+      assembly: {
+        type: 'timeline',
+        timeline: { segments: [{ id: 's1', shotId: 's1', durationSec: 'auto' }] },
+      } as never,
+    });
+    symlinkSync(outside, join(jobDir, 'assembly'));
+    await expect(
+      runRender({
+        renderSpecPath: join(jobDir, 'render-input.json'),
+        ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      }),
+    ).rejects.toThrow(/assembly directory escapes/);
+    expect(calls.submit).toBe(0);
+  });
+
+  it('rejects timeline narration without Edge TTS opt-in before paid submission', async () => {
+    const frame = makeFrame(cwd, 'timeline-voice.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+      assembly: {
+        type: 'timeline',
+        timeline: {
+          segments: [{ id: 's1', shotId: 's1', durationSec: 1, narration: '旁白' }],
+        },
+      } as never,
+    });
+    await expect(
+      runRender({
+        renderSpecPath: join(jobDir, 'render-input.json'),
+        ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      }),
+    ).rejects.toThrow(/Edge TTS opt-in/);
+    expect(calls.submit).toBe(0);
+  });
+
+  it('rejects a transition on the final timeline segment before paid submission', async () => {
+    const frame = makeFrame(cwd, 'timeline-last-transition.png');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        { id: 's1', firstFramePath: frame, prompt: { visuals: 'medium shot', action: 'moves' } },
+      ],
+      assembly: {
+        type: 'timeline',
+        timeline: {
+          segments: [
+            {
+              id: 's1',
+              shotId: 's1',
+              durationSec: 2,
+              transitionTo: { type: 'xfade', style: 'fade', durationSec: 0.5 },
+            },
+          ],
+        },
+      } as never,
+    });
+    await expect(
+      runRender({
+        renderSpecPath: join(jobDir, 'render-input.json'),
+        ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      }),
+    ).rejects.toThrow(/LAST segment/);
+    expect(calls.submit).toBe(0);
+  });
+
+  it('rejects a completed render when timeline child QC is missing', async () => {
+    const clip = join(cwd, 'existing.mp4');
+    const ffmpegPath = resolveFfmpeg().path;
+    execFileSync(ffmpegPath, [
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=red:size=64x64:rate=25',
+      '-t',
+      '1',
+      '-c:v',
+      'mpeg4',
+      '-y',
+      clip,
+    ]);
+    const jobDir = makeJob(cwd, {
+      shots: [{ id: 's1', videoPath: clip }],
+      assembly: {
+        type: 'timeline',
+        timeline: { segments: [{ id: 'segment-1', shotId: 's1', durationSec: 1 }] },
+      } as never,
+    });
+    const opts = {
+      ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      resolved: undefined,
+      adapter: undefined,
+      ffmpegPath,
+      verifyMedia: true,
+    };
+    await runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts });
+    const assemblyDir = join(jobDir, 'assembly');
+    const child = loadTimelineJob(assemblyDir)!;
+    const qc = Object.keys(child.artifactHashes).find((path) => path.startsWith('qc/'))!;
+    rmSync(join(assemblyDir, qc));
+    await expect(
+      runRender({ renderSpecPath: join(jobDir, 'render-input.json'), ...opts }),
+    ).rejects.toThrow(/artifact.*missing|missing.*artifact/i);
+    expect(calls.submit).toBe(0);
+  });
+
+  it('samples the finished concat at the actual midpoint of each unequal shot', async () => {
+    const ffmpegPath = resolveFfmpeg().path;
+    const clips = [
+      { id: 'short', color: 'red', durationSec: 1 },
+      { id: 'long', color: 'blue', durationSec: 10 },
+    ].map((shot) => {
+      const videoPath = join(cwd, `${shot.id}.mp4`);
+      execFileSync(ffmpegPath, [
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        `color=${shot.color}:size=64x64:rate=25`,
+        '-t',
+        String(shot.durationSec),
+        '-c:v',
+        'mpeg4',
+        '-y',
+        videoPath,
+      ]);
+      return { id: shot.id, videoPath, durationSec: shot.durationSec };
+    });
+    const jobDir = makeJob(cwd, { shots: clips.map(({ id, videoPath }) => ({ id, videoPath })) });
+    const result = await runRender({
+      renderSpecPath: join(jobDir, 'render-input.json'),
+      ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      resolved: undefined,
+      adapter: undefined,
+      concatImpl: undefined,
+      ffmpegPath,
+      verifyMedia: true,
+    });
+    const report = JSON.parse(readFileSync(result.qcReportPath!, 'utf8'));
+    expect(report.final.samples.map((sample: { timeSec: number }) => sample.timeSec)).toEqual([
+      0.5, 6,
+    ]);
+  });
+
+  it('samples the finished timeline at resolved segment midpoints', async () => {
+    const ffmpegPath = resolveFfmpeg().path;
+    const clips = [
+      { id: 'short', durationSec: 1 },
+      { id: 'long', durationSec: 4 },
+    ].map((shot) => {
+      const videoPath = join(cwd, `${shot.id}.mp4`);
+      execFileSync(ffmpegPath, [
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=blue:size=64x64:rate=25',
+        '-t',
+        String(shot.durationSec),
+        '-c:v',
+        'mpeg4',
+        '-y',
+        videoPath,
+      ]);
+      return { id: shot.id, videoPath, durationSec: shot.durationSec };
+    });
+    const jobDir = makeJob(cwd, {
+      shots: clips.map(({ id, videoPath }) => ({ id, videoPath })),
+      assembly: {
+        type: 'timeline',
+        timeline: {
+          segments: clips.map((shot) => ({
+            id: shot.id,
+            shotId: shot.id,
+            durationSec: shot.durationSec,
+          })),
+        },
+      } as never,
+    });
+    const result = await runRender({
+      renderSpecPath: join(jobDir, 'render-input.json'),
+      ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      resolved: undefined,
+      adapter: undefined,
+      ffmpegPath,
+      verifyMedia: true,
+    });
+    const report = JSON.parse(readFileSync(result.qcReportPath!, 'utf8'));
+    expect(report.final.samples.map((sample: { timeSec: number }) => sample.timeSec)).toEqual([
+      0.5, 3,
+    ]);
+  });
+
+  it('checks Remotion before submitting any paid shot', async () => {
+    const frame = makeFrame(cwd, 'opening.png');
+    const project = join(cwd, 'project');
+    mkdirSync(join(project, 'src'), { recursive: true });
+    writeFileSync(join(project, 'package.json'), '{}');
+    writeFileSync(join(project, 'src', 'index.ts'), 'root');
+    const jobDir = makeJob(cwd, {
+      shots: [
+        {
+          id: 'opening',
+          firstFramePath: frame,
+          prompt: { visuals: 'medium shot', action: 'walks' },
+        },
+      ],
+      assembly: {
+        type: 'remotion',
+        projectDir: project,
+        compositionId: 'Promo',
+        browserExecutable: join(cwd, 'missing-browser'),
+      },
+    });
+    await expect(
+      runRender({
+        renderSpecPath: join(jobDir, 'render-input.json'),
+        trusted: true,
+        ...baseOpts(cwd, mockAdapter(calls), concatCalls),
+      }),
+    ).rejects.toThrow(/browser/i);
+    expect(calls.submit).toBe(0);
   });
 
   it('renders an asset-only shot without a first frame and normalizes asset URIs', async () => {
@@ -516,6 +884,9 @@ describe('runRender', () => {
 
     // simulate crash after s2 submitted but before download
     const manifest = loadRenderJob(jobDir)!;
+    manifest.state = 'rendering';
+    manifest.finalVideoPath = undefined;
+    manifest.finalVideoHash = undefined;
     manifest.shots.s2 = {
       ...manifest.shots.s2,
       state: 'submitted',

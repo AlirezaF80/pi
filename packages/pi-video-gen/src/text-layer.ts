@@ -109,28 +109,36 @@ function positionFor(
   return { x: marginX, y: height - marginY - blockH, anchor: 'start' };
 }
 
-function overlaySvg(overlay: TimelineOverlay, width: number, height: number): string {
+function overlaySvg(
+  overlay: TimelineOverlay,
+  width: number,
+  height: number,
+  titleLines: string[],
+  subtitleLines: string[],
+): string {
   const titleSize = Math.max(28, Math.round(height * 0.055));
   const subtitleSize = Math.max(20, Math.round(height * 0.032));
   const lineGap = Math.round(titleSize * 0.5);
   const blockH =
-    (overlay.title ? titleSize : 0) +
-    (overlay.title && overlay.subtitle ? lineGap : 0) +
-    (overlay.subtitle ? subtitleSize : 0);
+    titleLines.length * Math.round(titleSize * 1.25) +
+    (titleLines.length && subtitleLines.length ? lineGap : 0) +
+    subtitleLines.length * Math.round(subtitleSize * 1.25);
   const { x, y, anchor } = positionFor(overlay.position, width, height, blockH);
 
   const lines: string[] = [];
   let cursorY = y + titleSize;
-  if (overlay.title) {
+  for (const line of titleLines) {
     lines.push(
-      `<text x="${x}" y="${cursorY}" font-size="${titleSize}" font-weight="700" fill="#ffffff" text-anchor="${anchor}" font-family="${FONT_STACK}">${escapeXml(overlay.title)}</text>`,
+      `<text x="${x}" y="${cursorY}" font-size="${titleSize}" font-weight="700" fill="#ffffff" text-anchor="${anchor}" font-family="${FONT_STACK}">${escapeXml(line)}</text>`,
     );
-    cursorY += lineGap + (overlay.subtitle ? subtitleSize : 0);
+    cursorY += Math.round(titleSize * 1.25);
   }
-  if (overlay.subtitle) {
+  if (titleLines.length && subtitleLines.length) cursorY += lineGap;
+  for (const line of subtitleLines) {
     lines.push(
-      `<text x="${x}" y="${cursorY}" font-size="${subtitleSize}" font-weight="400" fill="rgba(255,255,255,0.85)" text-anchor="${anchor}" font-family="${FONT_STACK}">${escapeXml(overlay.subtitle)}</text>`,
+      `<text x="${x}" y="${cursorY}" font-size="${subtitleSize}" font-weight="400" fill="rgba(255,255,255,0.85)" text-anchor="${anchor}" font-family="${FONT_STACK}">${escapeXml(line)}</text>`,
     );
+    cursorY += Math.round(subtitleSize * 1.25);
   }
 
   // Soft dark plate behind the text block for legibility over any image.
@@ -140,6 +148,22 @@ function overlaySvg(overlay: TimelineOverlay, width: number, height: number): st
   const plate = `<rect x="0" y="${plateY}" width="${width}" height="${plateH}" fill="rgba(0,0,0,0.32)"/>`;
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${plate}${lines.join('')}</svg>`;
+}
+
+async function actualTextWidth(
+  text: string,
+  fontSize: number,
+  weight: number,
+  maxWidth: number,
+): Promise<number> {
+  const size = Math.max(
+    512,
+    Math.ceil(maxWidth * 2),
+    Math.ceil(estimatedTextWidth(text, fontSize) * 2 + fontSize * 4),
+  );
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${fontSize * 4}"><text x="${fontSize}" y="${fontSize * 2}" font-size="${fontSize}" font-weight="${weight}" fill="#fff" font-family="${FONT_STACK}">${escapeXml(text)}</text></svg>`;
+  const { info } = await sharp(Buffer.from(svg)).trim().png().toBuffer({ resolveWithObject: true });
+  return info.width;
 }
 
 /** Render an overlay to a PNG with alpha, sized to the video frame. */
@@ -157,7 +181,34 @@ export async function renderTextOverlay(opts: {
       'text-layer: CJK font missing',
     );
   }
-  const svg = overlaySvg(opts.overlay, opts.width, opts.height);
+  const titleSize = Math.max(28, Math.round(opts.height * 0.055));
+  const subtitleSize = Math.max(20, Math.round(opts.height * 0.032));
+  const maxWidth = opts.width * (1 - SAFE_MARGIN_RATIO * 2);
+  const titleLines = opts.overlay.title
+    ? wrapSubtitleLines(opts.overlay.title, titleSize, maxWidth)
+    : [];
+  const subtitleLines = opts.overlay.subtitle
+    ? wrapSubtitleLines(opts.overlay.subtitle, subtitleSize, maxWidth)
+    : [];
+  for (const [line, size, weight] of [
+    ...titleLines.map((line) => [line, titleSize, 700] as const),
+    ...subtitleLines.map((line) => [line, subtitleSize, 400] as const),
+  ]) {
+    if ((await actualTextWidth(line, size, weight, maxWidth)) > maxWidth)
+      throw new VideoGenError(
+        'Text overlay exceeds the safe frame width. Shorten the title or reduce text length.',
+        'text-layer: overlay width',
+      );
+  }
+  const blockH =
+    titleLines.length * Math.round(titleSize * 1.25) +
+    subtitleLines.length * Math.round(subtitleSize * 1.25);
+  if (blockH + titleSize > opts.height * (1 - SAFE_MARGIN_RATIO * 2))
+    throw new VideoGenError(
+      'Text overlay exceeds the safe frame height. Shorten the title or subtitle.',
+      'text-layer: overlay height',
+    );
+  const svg = overlaySvg(opts.overlay, opts.width, opts.height, titleLines, subtitleLines);
   // Render the SVG at ~2x density for crisp text, then downscale to frame size.
   await sharp(Buffer.from(svg, 'utf-8'), { density: 150 })
     .resize(opts.width, opts.height)
@@ -185,6 +236,15 @@ export async function renderBurnedSubtitle(opts: {
   const margin = Math.round(opts.height * SAFE_MARGIN_RATIO);
   const padding = Math.round(fontSize * 0.5);
   const lines = wrapSubtitleLines(opts.text, fontSize, opts.width - margin * 2 - padding * 2);
+  for (const line of lines)
+    if (
+      (await actualTextWidth(line, fontSize, 500, opts.width - margin * 2 - padding * 2)) >
+      opts.width - margin * 2 - padding * 2
+    )
+      throw new VideoGenError(
+        'Burned subtitle exceeds the safe frame width. Shorten the text or reduce subtitles.fontSize.',
+        'text-layer: subtitle width',
+      );
   const blockHeight = Math.max(1, lines.length) * lineHeight;
   if (blockHeight + padding * 2 > opts.height - margin * 2) {
     throw new VideoGenError(

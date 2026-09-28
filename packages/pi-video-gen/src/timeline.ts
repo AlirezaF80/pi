@@ -361,6 +361,12 @@ export function parseTimelineSpec(raw: string): TimelineSpec {
           'timeline: transition too long',
         );
       }
+      if (i === spec.segments.length - 1) {
+        throw new VideoGenError(
+          `Segment "${seg.id}": the LAST segment must not have a transitionTo — there is nothing after it.`,
+          'timeline: transition invalid',
+        );
+      }
     }
     if (seg.overlay?.position !== undefined && !OVERLAY_POSITIONS.includes(seg.overlay.position)) {
       throw new VideoGenError(
