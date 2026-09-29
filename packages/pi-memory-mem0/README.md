@@ -220,6 +220,8 @@ The extension automatically:
 
 ### External Vector Store (e.g. Qdrant)
 
+The Qdrant JavaScript client is installed with this extension; a running Qdrant server is still required.
+
 For production workloads that need a dedicated vector database:
 
 ```json
