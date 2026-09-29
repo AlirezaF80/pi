@@ -11,6 +11,9 @@ describe('embedded Qdrant dependency', () => {
     );
     // Workspace optional-peer hoisting must not hide a missing published dependency.
     expect(manifest.dependencies).toHaveProperty('@qdrant/js-client-rest', expect.any(String));
+    // mem0ai 3.3.1 calls QdrantClient.search(), removed in @qdrant/js-client-rest 1.19.0.
+    // Keep the range on 1.18.x until mem0ai no longer needs search().
+    expect(manifest.dependencies['@qdrant/js-client-rest']).toMatch(/^~?1\.18\.\d+$/);
 
     const output = execFileSync(
       process.execPath,
@@ -25,7 +28,9 @@ describe('embedded Qdrant dependency', () => {
         response.end(JSON.stringify(request.url === '/'
           ? { title: 'qdrant', version: '1.18.0' }
           : { status: 'ok', time: 0, result: request.url.endsWith('/points/scroll')
-              ? { points: [], next_page_offset: null } : true }));
+              ? { points: [], next_page_offset: null }
+              : request.url.endsWith('/points/search') ? []
+              : request.url.endsWith('/points/query') ? { points: [] } : true }));
       });
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       try {
@@ -35,7 +40,9 @@ describe('embedded Qdrant dependency', () => {
           dimension: 3,
         });
         await store.initialize();
-        process.stdout.write(JSON.stringify(await store.list({ user_id: 'test-user' })));
+        const listed = await store.list({ user_id: 'test-user' });
+        const found = await store.search([0.1, 0.2, 0.3], 1, { user_id: 'test-user' });
+        process.stdout.write(JSON.stringify({ listed, found }));
       } finally {
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
@@ -44,6 +51,6 @@ describe('embedded Qdrant dependency', () => {
       ],
       { cwd: packageDir, encoding: 'utf8', timeout: 20_000 },
     );
-    expect(JSON.parse(output)).toEqual([[], 0]);
+    expect(JSON.parse(output)).toEqual({ listed: [[], 0], found: [] });
   }, 30_000);
 });

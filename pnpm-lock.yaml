@@ -251,7 +251,7 @@ importers:
         specifier: workspace:*
         version: link:../shared
       '@qdrant/js-client-rest':
-        specifier: ^1.18.0
+        specifier: ~1.18.0
         version: 1.18.0(typescript@5.9.3)
       mem0ai:
         specifier: 3.3.1
