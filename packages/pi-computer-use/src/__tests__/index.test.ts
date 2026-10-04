@@ -597,10 +597,13 @@ describe('computerUseExtension', () => {
       .get('computer_use_get_window_state')!
       .execute('id', { pid: 1, window_id: 2 }, controller.signal, undefined, mockCtx)) as any;
 
-    expect(result.content).toEqual([
-      { type: 'image', data: 'image-base64', mimeType: 'image/png' },
-      { type: 'text', text: 'window state' },
-    ]);
+    const imageItems = result.content.filter((item: any) => item.type === 'image');
+    expect(imageItems).toEqual([{ type: 'image', data: 'image-base64', mimeType: 'image/png' }]);
+    const texts = result.content
+      .filter((item: any) => item.type === 'text')
+      .map((item: any) => item.text);
+    expect(texts).toContain('window state');
+    expect(texts.join('\n')).toContain('snapshot_id=snapshot-1');
     expect(result.details.snapshot_id).toBe('snapshot-1');
     expect(lastRequestOptions?.signal).toBe(controller.signal);
   });

@@ -408,7 +408,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
               }
             }
 
-            return toPiToolResult(result);
+            return toPiToolResult(result, originalName);
           } catch (connErr) {
             if (signal?.aborted) throw connErr;
             const msg = connErr instanceof Error ? connErr.message : String(connErr);
