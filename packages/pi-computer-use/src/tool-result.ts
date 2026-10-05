@@ -149,7 +149,7 @@ export function toPiToolResult(
   return {
     content,
     details,
-    ...(result.isError ? { isError: true } : {}),
+    ...(result.isError || result.structuredContent?.status === 'refused' ? { isError: true } : {}),
   };
 }
 
@@ -288,14 +288,32 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
   if (Object.keys(handles).length > 0) parts.push(JSON.stringify(handles));
   if (toolName === 'browser_prepare') return parts.length > 1 ? parts.join('\n') : undefined;
 
+  const snapshot = sc.snapshot;
+  if (snapshot && typeof snapshot === 'object') {
+    const { complete, continuation } = snapshot as Record<string, unknown>;
+    if (typeof complete === 'boolean') parts.push(JSON.stringify({ complete }));
+    if (typeof continuation === 'string' && continuation.length <= 512) {
+      parts.push(JSON.stringify({ continuation }));
+    }
+  }
+
   // Preserve complete addressing records; a truncated opaque ref cannot be used.
   for (const [key, idKey] of [
     ['tabs', 'tab_id'],
     ['refs', 'ref'],
   ] as const) {
     const records = asRecordArray(sc[key]);
+    // Put editable controls before decorative clickable images on crowded pages.
+    const ranked =
+      key === 'refs'
+        ? [...records].sort(
+            (a, b) =>
+              Number(Array.isArray(b.actions) && b.actions.includes('type')) -
+              Number(Array.isArray(a.actions) && a.actions.includes('type')),
+          )
+        : records;
     let shown = 0;
-    for (const record of records) {
+    for (const record of ranked) {
       const id = record[idKey];
       if (typeof id !== 'string' || !id || id.length > 256) continue;
       const visible: Record<string, unknown> = { [idKey]: id };
@@ -311,7 +329,7 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       const line = JSON.stringify(visible);
       if (
         parts.length >= ENRICHMENT_MAX_LINES - 2 ||
-        byteLength([...parts, line].join('\n')) > ENRICHMENT_MAX_BYTES - 128
+        byteLength([...parts, line].join('\n')) > ENRICHMENT_MAX_BYTES - 1536
       ) {
         break;
       }

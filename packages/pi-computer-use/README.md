@@ -128,7 +128,11 @@ Linux and Windows tool descriptions and schemas come from the exact live driver.
 
 Browser preparation exposes `prepared_pid` in tool text so an agent can discover the isolated browser's native window with a PID-filtered lookup. Browser state exposes target/tab handles, tab records, and actionable refs with their labels and supported actions. This supplements the driver's summary text, since Pi does not send structured `details` to the model.
 
-Addressing records share the existing 4KB/60-line enrichment budget. Opaque identifiers are kept complete; the output reports how many records were shown. A semantic page outline uses any remaining space so the agent can observe page content and outcomes. Structured input values, content refs, screenshots, and unrelated driver metadata are not copied into the addressing records; the driver's page outline may contain visible input values.
+Addressing records share the existing 4KB/60-line enrichment budget. Opaque identifiers are kept complete; the output reports how many records were shown. Editable refs are shown first and 1536 bytes are reserved for the semantic page outline. Snapshot completeness and bounded continuation tokens are exposed so the agent can request another portion. Structured input values, content refs, screenshots, and unrelated driver metadata are not copied into the addressing records; the driver's page outline may contain visible input values. Structured `status: "refused"` results are reported as tool errors even when the driver omits `isError`.
+
+## Ordinary browser requests
+
+Users can ask to find products or read reviews in normal language. The extension augments the live browser tool descriptions with preparation and observation guidance: start an isolated browser for public browsing, discover and bind its window, prefer semantic snapshots, and avoid repeatedly guessing empty queries. Process identifiers and refs are handled by the agent. This guidance ships with the extension and does not require a custom system prompt from a launcher. It guides the model; it does not replace confirmations or enforce a transaction policy.
 
 ## License
 
