@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_BYTES } from '@earendil-works/pi-coding-agent';
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from '@earendil-works/pi-coding-agent';
 import { describe, expect, it } from 'vitest';
 import { toPiToolResult } from '../tool-result.js';
 
@@ -44,6 +44,20 @@ describe('toPiToolResult', () => {
   });
 
   describe('model-visible enrichment', () => {
+    it('preserves snapshot addressing within the total line budget', () => {
+      const result = toPiToolResult(
+        {
+          content: [{ type: 'text', text: Array(2000).fill('row').join('\n') }],
+          structuredContent: { snapshot_id: 's00000001' },
+        },
+        'get_window_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text.split('\n').length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+      expect(text).toContain('snapshot_id=s00000001');
+      expect(text).toContain('truncated output');
+    });
+
     it('appends snapshot_id for get_window_state when the driver text lacks it', () => {
       const result = toPiToolResult(
         {

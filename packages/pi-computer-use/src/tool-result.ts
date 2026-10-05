@@ -100,13 +100,17 @@ export function toPiToolResult(
 } {
   const content: PiToolContent[] = [];
   const details = boundStructuredContent(result.structuredContent);
-  const enrichment = toolName ? buildEnrichment(toolName, result) : undefined;
-  const enrichmentBytes = enrichment ? Math.min(byteLength(enrichment), ENRICHMENT_MAX_BYTES) : 0;
+  const enrichment = fitSerializedString(
+    toolName ? (buildEnrichment(toolName, result) ?? '') : '',
+    ENRICHMENT_MAX_BYTES,
+    ENRICHMENT_MAX_LINES,
+  );
+  const enrichmentBytes = enrichment ? byteLength(enrichment) : 0;
   let remainingBytes = Math.max(
     0,
     MAX_RESULT_BYTES - byteLength(details) - SERIALIZATION_OVERHEAD_BYTES - enrichmentBytes,
   );
-  let remainingLines = DEFAULT_MAX_LINES;
+  let remainingLines = DEFAULT_MAX_LINES - (enrichment ? enrichment.split('\n').length : 0);
 
   for (const item of result.content ?? []) {
     if (item.type === 'image' && item.data) {
@@ -138,10 +142,7 @@ export function toPiToolResult(
     remainingLines -= text.split('\n').length;
   }
 
-  if (enrichment) {
-    const text = fitSerializedString(enrichment, enrichmentBytes, ENRICHMENT_MAX_LINES);
-    if (text) content.push({ type: 'text', text });
-  }
+  if (enrichment) content.push({ type: 'text', text: enrichment });
 
   if (content.length === 0) content.push({ type: 'text', text: 'Action executed.' });
 
