@@ -102,8 +102,8 @@ export function toPiToolResult(
   const details = boundStructuredContent(result.structuredContent);
   const enrichment = fitSerializedString(
     toolName ? (buildEnrichment(toolName, result) ?? '') : '',
-    ENRICHMENT_MAX_BYTES,
-    ENRICHMENT_MAX_LINES,
+    toolName === 'get_browser_state' ? BROWSER_MAX_BYTES : ENRICHMENT_MAX_BYTES,
+    toolName === 'get_browser_state' ? BROWSER_MAX_LINES : ENRICHMENT_MAX_LINES,
   );
   const enrichmentBytes = enrichment ? byteLength(enrichment) : 0;
   let remainingBytes = Math.max(
@@ -166,6 +166,8 @@ export function toPiToolResult(
 
 const ENRICHMENT_MAX_BYTES = 4 * 1024;
 const ENRICHMENT_MAX_LINES = 60;
+const BROWSER_MAX_BYTES = 8 * 1024;
+const BROWSER_MAX_LINES = 120;
 const LIST_WINDOWS_MAX_RECORDS = 20;
 // Matches the tree-row format the cua-driver 0.28.x MCP text output emits
 // ("- [N] <role> ..."). Undocumented upstream format; a false positive only
@@ -301,6 +303,7 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
   for (const [key, idKey] of [
     ['tabs', 'tab_id'],
     ['refs', 'ref'],
+    ['content_refs', 'ref'],
   ] as const) {
     const records = asRecordArray(sc[key]);
     // Put editable controls before decorative clickable images on crowded pages.
@@ -308,8 +311,10 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       key === 'refs'
         ? [...records].sort(
             (a, b) =>
-              Number(Array.isArray(b.actions) && b.actions.includes('type')) -
-              Number(Array.isArray(a.actions) && a.actions.includes('type')),
+              Number(Array.isArray(b.actions) && b.actions.includes('type')) * 2 +
+              Number(typeof b.name === 'string' && b.name.length > 0) -
+              (Number(Array.isArray(a.actions) && a.actions.includes('type')) * 2 +
+                Number(typeof a.name === 'string' && a.name.length > 0)),
           )
         : records;
     let shown = 0;
@@ -328,8 +333,9 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       if (typeof record.active === 'boolean') visible.active = record.active;
       const line = JSON.stringify(visible);
       if (
-        parts.length >= ENRICHMENT_MAX_LINES - 2 ||
-        byteLength([...parts, line].join('\n')) > ENRICHMENT_MAX_BYTES - 1536
+        parts.length >= BROWSER_MAX_LINES - 30 ||
+        byteLength([...parts, line].join('\n')) >
+          BROWSER_MAX_BYTES - (key === 'content_refs' ? 2048 : 4096)
       ) {
         break;
       }
@@ -338,11 +344,14 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
     }
     if (records.length > 0) parts.push(`${key}: ${shown} of ${records.length} records shown`);
   }
-  if (typeof sc.outline === 'string' && parts.length < ENRICHMENT_MAX_LINES - 1) {
+  if (typeof sc.outline === 'string' && parts.length < BROWSER_MAX_LINES - 1) {
     const outline = fitSerializedString(
-      sc.outline,
-      Math.max(0, ENRICHMENT_MAX_BYTES - byteLength(parts.join('\n')) - 32),
-      ENRICHMENT_MAX_LINES - parts.length - 1,
+      sc.outline
+        .split('\n')
+        .filter((line) => !/^\s*- (generic|paragraph)\s*$/.test(line))
+        .join('\n'),
+      Math.max(0, BROWSER_MAX_BYTES - byteLength(parts.join('\n')) - 32),
+      BROWSER_MAX_LINES - parts.length - 1,
     );
     if (outline) parts.push(`Page outline:\n${outline}`);
   }
