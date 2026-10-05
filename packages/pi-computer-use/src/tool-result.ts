@@ -219,6 +219,9 @@ function formatWindowRecord(window: Record<string, unknown>): string | undefined
 function buildEnrichment(toolName: string, result: McpToolResult): string | undefined {
   const sc = result.structuredContent;
   if (!sc || typeof sc !== 'object') return undefined;
+  if (toolName === 'browser_prepare' || toolName === 'get_browser_state') {
+    return buildBrowserEnrichment(toolName, sc);
+  }
   const existingText = (result.content ?? [])
     .filter((item) => item.type === 'text')
     .map((item) => item.text ?? '')
@@ -265,4 +268,65 @@ function buildEnrichment(toolName: string, result: McpToolResult): string | unde
   }
 
   return parts.length > 0 ? `[pi-computer-use model-visible]\n${parts.join('\n')}` : undefined;
+}
+
+function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): string | undefined {
+  const parts = ['[pi-computer-use browser addressing]'];
+  const handles: Record<string, unknown> = {};
+  for (const key of toolName === 'browser_prepare'
+    ? ['prepared_pid']
+    : ['target_id', 'tab_id', 'snapshot_id']) {
+    const value = sc[key];
+    if (
+      key === 'prepared_pid'
+        ? typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+        : typeof value === 'string' && value.length > 0 && value.length <= 256
+    ) {
+      handles[key] = value;
+    }
+  }
+  if (Object.keys(handles).length > 0) parts.push(JSON.stringify(handles));
+  if (toolName === 'browser_prepare') return parts.length > 1 ? parts.join('\n') : undefined;
+
+  // Preserve complete addressing records; a truncated opaque ref cannot be used.
+  for (const [key, idKey] of [
+    ['tabs', 'tab_id'],
+    ['refs', 'ref'],
+  ] as const) {
+    const records = asRecordArray(sc[key]);
+    let shown = 0;
+    for (const record of records) {
+      const id = record[idKey];
+      if (typeof id !== 'string' || !id || id.length > 256) continue;
+      const visible: Record<string, unknown> = { [idKey]: id };
+      for (const field of ['title', 'frame', 'role', 'name', 'node', 'label', 'visibility']) {
+        if (typeof record[field] === 'string') visible[field] = record[field].slice(0, 160);
+      }
+      if (Array.isArray(record.actions)) {
+        visible.actions = record.actions
+          .filter((action) => typeof action === 'string' && action.length <= 40)
+          .slice(0, 10);
+      }
+      if (typeof record.active === 'boolean') visible.active = record.active;
+      const line = JSON.stringify(visible);
+      if (
+        parts.length >= ENRICHMENT_MAX_LINES - 2 ||
+        byteLength([...parts, line].join('\n')) > ENRICHMENT_MAX_BYTES - 128
+      ) {
+        break;
+      }
+      parts.push(line);
+      shown++;
+    }
+    if (records.length > 0) parts.push(`${key}: ${shown} of ${records.length} records shown`);
+  }
+  if (typeof sc.outline === 'string' && parts.length < ENRICHMENT_MAX_LINES - 1) {
+    const outline = fitSerializedString(
+      sc.outline,
+      Math.max(0, ENRICHMENT_MAX_BYTES - byteLength(parts.join('\n')) - 32),
+      ENRICHMENT_MAX_LINES - parts.length - 1,
+    );
+    if (outline) parts.push(`Page outline:\n${outline}`);
+  }
+  return parts.length > 1 ? parts.join('\n') : undefined;
 }

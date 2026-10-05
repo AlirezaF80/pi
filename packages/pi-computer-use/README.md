@@ -124,6 +124,12 @@ Driver startup, reconnect, and the first macOS permission probe are session-owne
 
 Linux and Windows tool descriptions and schemas come from the exact live driver. macOS uses the generated manifest for the bundled driver release.
 
+## Model-visible browser results
+
+Browser preparation exposes `prepared_pid` in tool text so an agent can discover the isolated browser's native window with a PID-filtered lookup. Browser state exposes target/tab handles, tab records, and actionable refs with their labels and supported actions. This supplements the driver's summary text, since Pi does not send structured `details` to the model.
+
+Addressing records share the existing 4KB/60-line enrichment budget. Opaque identifiers are kept complete; the output reports how many records were shown. A semantic page outline uses any remaining space so the agent can observe page content and outcomes. Structured input values, content refs, screenshots, and unrelated driver metadata are not copied into the addressing records; the driver's page outline may contain visible input values.
+
 ## License
 
 Apache-2.0 for this extension package. Bundled Cua Driver assets retain the upstream MIT license and release metadata in each platform package.
