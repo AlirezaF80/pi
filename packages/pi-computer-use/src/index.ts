@@ -419,6 +419,9 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
           try {
             await ensureConnected(signal, originalName !== 'check_permissions');
             const driverParams = { ...params };
+            if (originalName === 'get_browser_state' && driverParams.continuation === '') {
+              delete driverParams.continuation;
+            }
             if (isBrowserTool) {
               const owner =
                 typeof driverParams.target_id === 'string'

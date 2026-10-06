@@ -372,6 +372,62 @@ describe('computerUseExtension', () => {
     expect(calls.at(-1)!.args.session).not.toBe('explicit-label-probe');
   });
 
+  it('omits only an empty browser continuation before forwarding', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const targetId = 'target-for-empty-continuation';
+    const tabId = 'tab-for-empty-continuation';
+    await start();
+    mockCallTool = (name, args) => {
+      calls.push({ name, args });
+      return name === 'get_browser_state'
+        ? {
+            content: [{ type: 'text', text: 'Snapshot.' }],
+            structuredContent: {
+              target_id: targetId,
+              tabs: [{ tab_id: tabId, title: 'Fixture', active: true }],
+            },
+          }
+        : { content: [{ type: 'text', text: 'OK.' }] };
+    };
+
+    const state = tools.get('computer_use_get_browser_state')!;
+    const stateCalls = () => calls.filter((call) => call.name === 'get_browser_state');
+    await state.execute(
+      'bind-empty',
+      { pid: 42, window_id: 84, continuation: '' },
+      undefined,
+      undefined,
+      mockCtx,
+    );
+    expect(stateCalls()[0]!.args).toMatchObject({ pid: 42, window_id: 84 });
+    expect(stateCalls()[0]!.args).not.toHaveProperty('continuation');
+
+    await state.execute(
+      'query-empty',
+      { target_id: targetId, tab_id: tabId, query: 'observed phrase', continuation: '' },
+      undefined,
+      undefined,
+      mockCtx,
+    );
+    expect(stateCalls()[1]!.args).toMatchObject({
+      target_id: targetId,
+      tab_id: tabId,
+      query: 'observed phrase',
+    });
+    expect(stateCalls()[1]!.args).not.toHaveProperty('continuation');
+
+    for (const continuation of ['opaque-token-from-snapshot', ' ', 'null']) {
+      await state.execute(
+        `continue-${continuation}`,
+        { target_id: targetId, tab_id: tabId, continuation },
+        undefined,
+        undefined,
+        mockCtx,
+      );
+      expect(stateCalls().at(-1)!.args.continuation).toBe(continuation);
+    }
+  });
+
   it('uses bound handles and the returned opaque token for later browser snapshots', async () => {
     const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
     const targetId = 'target-from-bind';
