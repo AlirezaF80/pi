@@ -272,6 +272,15 @@ describe('computerUseExtension', () => {
     };
     const state = tools.get('computer_use_get_browser_state')!;
     const pointer = tools.get('computer_use_browser_pointer')!;
+    expect(state.description).toContain('unfiltered observation');
+    expect(state.description).toContain('include_screenshot:false');
+    expect(state.description).toContain('complete describes only the selected scope');
+    expect(state.description).toContain('Bind once with pid + window_id');
+    expect(state.description).toContain('returned target_id + tab_id for snapshots');
+    expect(state.description).toContain('exact opaque continuation it returned');
+    expect(state.description).toContain('Never construct a continuation');
+    expect(tools.get('computer_use_list_windows')!.description).toContain('leave session omitted');
+    expect(tools.get('computer_use_list_windows')!.description).toContain('exact prepared_pid');
     expect(pointer.parameters.required ?? []).not.toContain('session');
     await state.execute('bind', { pid: 1, window_id: 2 }, undefined, undefined, mockCtx);
     const binding = calls.find((call) => call.name === 'get_browser_state')!.args;
@@ -301,6 +310,140 @@ describe('computerUseExtension', () => {
     );
     await pointer.execute('named-scroll', input, undefined, undefined, mockCtx);
     expect(calls.at(-1)!.args.session).toBe('named');
+  });
+
+  it('reuses a prepared browser session for window discovery by its exact PID', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    await start();
+    mockCallTool = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'browser_prepare' && args.session === 'failed-label') {
+        return {
+          content: [{ type: 'text', text: 'Preparation failed.' }],
+          structuredContent: { prepared_pid: 22054 },
+          isError: true,
+        };
+      }
+      return name === 'browser_prepare'
+        ? {
+            content: [{ type: 'text', text: 'Prepared.' }],
+            structuredContent: { prepared_pid: 22052 },
+          }
+        : { content: [{ type: 'text', text: 'Window list.' }] };
+    };
+
+    await tools
+      .get('computer_use_browser_prepare')!
+      .execute('prepare', { session: 'explicit-label-probe' }, undefined, undefined, mockCtx);
+    await tools
+      .get('computer_use_list_windows')!
+      .execute('known-pid', { pid: 22052 }, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args.session).toBe('explicit-label-probe');
+
+    await tools
+      .get('computer_use_list_windows')!
+      .execute(
+        'explicit-session',
+        { pid: 22052, session: 'explicit-list-label' },
+        undefined,
+        undefined,
+        mockCtx,
+      );
+    expect(calls.at(-1)!.args.session).toBe('explicit-list-label');
+
+    await tools
+      .get('computer_use_browser_prepare')!
+      .execute('failed-prepare', { session: 'failed-label' }, undefined, undefined, mockCtx);
+    await tools
+      .get('computer_use_list_windows')!
+      .execute('failed-pid', { pid: 22054 }, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args).not.toHaveProperty('session');
+
+    await tools
+      .get('computer_use_list_windows')!
+      .execute('unknown-pid', { pid: 22053 }, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args).not.toHaveProperty('session');
+
+    await handlers.session_start![0]({}, mockCtx);
+    await tools
+      .get('computer_use_list_windows')!
+      .execute('after-session-reset', { pid: 22052 }, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args).not.toHaveProperty('session');
+    expect(calls.at(-1)!.args.session).not.toBe('explicit-label-probe');
+  });
+
+  it('uses bound handles and the returned opaque token for later browser snapshots', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const targetId = 'target-from-bind';
+    const tabId = 'tab-from-bind';
+    const continuation = 'opaque-token-from-incomplete-snapshot';
+    await start();
+    mockCallTool = (name, args) => {
+      calls.push({ name, args });
+      if (name !== 'get_browser_state') return { content: [] };
+      if (typeof args.pid === 'number') {
+        return {
+          content: [{ type: 'text', text: 'Bound browser.' }],
+          structuredContent: {
+            target_id: targetId,
+            tabs: [{ tab_id: tabId, title: 'Example page', active: true }],
+          },
+        };
+      }
+      return {
+        content: [{ type: 'text', text: 'Snapshot page content.' }],
+        structuredContent: {
+          target_id: targetId,
+          tabs: [{ tab_id: tabId, title: 'Example page', active: true }],
+          snapshot: { complete: false, continuation },
+        },
+      };
+    };
+
+    const state = tools.get('computer_use_get_browser_state')!;
+    const binding = (await state.execute(
+      'bind',
+      { pid: 42, window_id: 84 },
+      undefined,
+      undefined,
+      mockCtx,
+    )) as { content: Array<{ text: string }> };
+    const bindingText = binding.content.map((item) => item.text).join('\n');
+    expect(bindingText).toContain(targetId);
+    expect(bindingText).toContain(tabId);
+
+    const snapshot = (await state.execute(
+      'snapshot',
+      { target_id: targetId, tab_id: tabId },
+      undefined,
+      undefined,
+      mockCtx,
+    )) as { content: Array<{ text: string }> };
+    expect(snapshot.content.map((item) => item.text).join('\n')).toContain(continuation);
+    const stateCalls = calls.filter((call) => call.name === 'get_browser_state');
+    expect(stateCalls[1]!.args).toMatchObject({
+      target_id: targetId,
+      tab_id: tabId,
+      snapshot_format: 'semantic_v2',
+      session: stateCalls[0]!.args.session,
+    });
+
+    await state.execute(
+      'continue',
+      { target_id: targetId, tab_id: tabId, continuation },
+      undefined,
+      undefined,
+      mockCtx,
+    );
+    const continuedCalls = calls.filter((call) => call.name === 'get_browser_state');
+    expect(continuedCalls[2]!.args).toMatchObject({
+      target_id: targetId,
+      tab_id: tabId,
+      continuation,
+      session: stateCalls[0]!.args.session,
+    });
+    expect(continuedCalls[2]!.args).not.toHaveProperty('pid');
+    expect(continuedCalls[2]!.args).not.toHaveProperty('window_id');
   });
 
   it('requests macOS permissions once on the first computer-use call', async () => {

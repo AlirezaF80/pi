@@ -293,7 +293,19 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
   const snapshot = sc.snapshot;
   if (snapshot && typeof snapshot === 'object') {
     const { complete, continuation } = snapshot as Record<string, unknown>;
-    if (typeof complete === 'boolean') parts.push(JSON.stringify({ complete }));
+    const metadata: Record<string, unknown> = {};
+    if (typeof complete === 'boolean') metadata.complete = complete;
+    const scope = (snapshot as Record<string, unknown>).scope;
+    if (typeof scope === 'string' && scope.length > 0 && scope.length <= 64) {
+      metadata.scope = scope;
+    }
+    for (const key of ['selected_nodes', 'total_nodes'] as const) {
+      const value = (snapshot as Record<string, unknown>)[key];
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+        metadata[key] = value;
+      }
+    }
+    if (Object.keys(metadata).length > 0) parts.push(JSON.stringify(metadata));
     if (typeof continuation === 'string' && continuation.length <= 512) {
       parts.push(JSON.stringify({ continuation }));
     }
@@ -306,17 +318,29 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
     ['content_refs', 'ref'],
   ] as const) {
     const records = asRecordArray(sc[key]);
+    const emptyStructural = (record: Record<string, unknown>) =>
+      key === 'content_refs' &&
+      (record.role === 'generic' || record.role === 'paragraph') &&
+      !['name', 'label', 'value', 'text'].some(
+        (field) => typeof record[field] === 'string' && (record[field] as string).trim().length > 0,
+      ) &&
+      !(
+        Array.isArray(record.actions) &&
+        record.actions.some((action) => typeof action === 'string' && action.trim().length > 0)
+      );
+    const omittedEmpty = records.filter(emptyStructural).length;
+    const candidates = records.filter((record) => !emptyStructural(record));
     // Put editable controls before decorative clickable images on crowded pages.
     const ranked =
       key === 'refs'
-        ? [...records].sort(
+        ? [...candidates].sort(
             (a, b) =>
               Number(Array.isArray(b.actions) && b.actions.includes('type')) * 2 +
               Number(typeof b.name === 'string' && b.name.length > 0) -
               (Number(Array.isArray(a.actions) && a.actions.includes('type')) * 2 +
                 Number(typeof a.name === 'string' && a.name.length > 0)),
           )
-        : records;
+        : candidates;
     let shown = 0;
     for (const record of ranked) {
       const id = record[idKey];
@@ -342,7 +366,11 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       parts.push(line);
       shown++;
     }
-    if (records.length > 0) parts.push(`${key}: ${shown} of ${records.length} records shown`);
+    if (records.length > 0) {
+      const omitted =
+        omittedEmpty > 0 ? `; ${omittedEmpty} empty generic/paragraph refs omitted` : '';
+      parts.push(`${key}: ${shown} of ${records.length} records shown${omitted}`);
+    }
   }
   if (typeof sc.outline === 'string' && parts.length < BROWSER_MAX_LINES - 1) {
     const outline = fitSerializedString(

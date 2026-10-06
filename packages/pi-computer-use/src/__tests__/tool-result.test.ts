@@ -70,6 +70,86 @@ describe('toPiToolResult', () => {
       expect(text).toContain('snapshot_id=s0000000d');
     });
 
+    it('exposes validated browser snapshot scope and node counts', () => {
+      const result = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'Two matching nodes.' }],
+          structuredContent: {
+            snapshot: {
+              complete: true,
+              scope: 'query',
+              selected_nodes: 2,
+              total_nodes: 2,
+            },
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text).toContain(
+        '{"complete":true,"scope":"query","selected_nodes":2,"total_nodes":2}',
+      );
+
+      const invalid = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'Snapshot.' }],
+          structuredContent: {
+            snapshot: {
+              complete: 'yes',
+              scope: 'x'.repeat(1000),
+              selected_nodes: -1,
+              total_nodes: Number.MAX_SAFE_INTEGER + 1,
+            },
+          },
+        },
+        'get_browser_state',
+      );
+      const invalidText = invalid.content
+        .map((item) => ('text' in item ? item.text : ''))
+        .join('\n');
+      expect(invalidText).not.toContain('selected_nodes');
+      expect(invalidText).not.toContain('total_nodes');
+      expect(invalidText).not.toContain('"scope"');
+      expect(invalidText).not.toContain('"complete"');
+    });
+
+    it('keeps late page context visible when empty structural refs crowd the snapshot', () => {
+      const emptyRefs = Array.from({ length: 100 }, (_, index) => ({
+        ref: `p8:${index}`,
+        role: index % 2 === 0 ? 'generic' : 'paragraph',
+        actions: [],
+      }));
+      const result = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'Page snapshot.' }],
+          structuredContent: {
+            content_refs: [
+              ...emptyRefs,
+              { ref: 'p8:99a', role: 'generic', name: '  ', label: '\t' },
+              { ref: 'p8:100', role: 'generic', name: 'Sample Author' },
+              { ref: 'p8:101', role: 'generic', text: 'Visible review body' },
+              { ref: 'p8:102', role: 'generic', actions: ['click'] },
+              { ref: 'p8:103', role: 'heading' },
+              { ref: 'p8:104', role: 'generic', value: '  Visible value  ' },
+            ],
+            outline: `Opening context ${'x'.repeat(3000)}\nReview by Sample Author: The item remained comfortable during extended use.`,
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text).toContain(
+        'Review by Sample Author: The item remained comfortable during extended use.',
+      );
+      expect(text).toContain('Sample Author');
+      expect(text).toContain('p8:101');
+      expect(text).toContain('p8:102');
+      expect(text).toContain('p8:103');
+      expect(text).toContain('p8:104');
+      expect(text).toContain('101 empty generic/paragraph refs omitted');
+      expect(text).toContain('5 of 106 records shown');
+    });
+
     it('does not duplicate snapshot_id when the driver text already carries it', () => {
       const result = toPiToolResult(
         {
