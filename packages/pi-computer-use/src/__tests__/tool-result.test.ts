@@ -150,6 +150,103 @@ describe('toPiToolResult', () => {
       expect(text).toContain('5 of 106 records shown');
     });
 
+    it('prioritizes readable content ahead of list structure and markers', () => {
+      const records = [
+        ...Array.from({ length: 70 }, (_, index) => ({
+          ref: `p9:${index}`,
+          role: 'listitem',
+          actions: [],
+        })),
+        ...Array.from({ length: 70 }, (_, index) => ({
+          ref: `p9:${index + 70}`,
+          role: 'listmarker',
+          name: '•',
+          actions: [],
+        })),
+        { ref: 'p9:190', role: 'listmarker', name: '1.', actions: [] },
+        { ref: 'p9:191', role: 'heading', name: 'Field notes', actions: [] },
+        {
+          ref: 'p9:192',
+          role: 'statictext',
+          name: 'A plain text body with useful nearby context.',
+          actions: [],
+        },
+        {
+          ref: 'p9:193',
+          role: 'statictext',
+          name: 'Author: Rowan Example. Label: field notes.',
+          actions: [],
+        },
+        { ref: 'p9:194', role: 'heading', name: 'Workshop report', actions: [] },
+        {
+          ref: 'p9:195',
+          role: 'statictext',
+          name: 'A second body with a separate observation.',
+          actions: [],
+        },
+      ];
+      const result = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'Snapshot contains the full selected node set.' }],
+          structuredContent: {
+            snapshot: { complete: true, scope: 'viewport', selected_nodes: 263, total_nodes: 263 },
+            content_refs: records,
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+
+      expect(text).toContain('Field notes');
+      expect(text).toContain('A plain text body with useful nearby context.');
+      expect(text).toContain('Author: Rowan Example. Label: field notes.');
+      expect(text).toContain('Workshop report');
+      expect(text).toContain('p9:193');
+      expect(text).toContain('content_refs:');
+      expect(text).toMatch(/content_refs: \d+ of 146 records shown/);
+      expect(result.details?.content_refs).toEqual(records);
+    });
+
+    it('retains numbered markers and unnamed actionable content when space permits', () => {
+      const result = toPiToolResult(
+        {
+          structuredContent: {
+            content_refs: [
+              { ref: 'p1:1', role: 'listmarker', name: '1.', actions: [] },
+              { ref: 'p1:2', role: 'button', actions: ['click'] },
+              { ref: 'p1:3', role: 'statictext', name: 'Readable body', actions: [] },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text).toContain('p1:1');
+      expect(text).toContain('p1:2');
+      expect(text).toContain('Readable body');
+      expect(text).toContain('3 of 3 records shown');
+    });
+
+    it('preserves readable author and body order across different roles', () => {
+      const result = toPiToolResult(
+        {
+          structuredContent: {
+            content_refs: [
+              { ref: 'p1:1', role: 'generic', name: 'Author A' },
+              { ref: 'p1:2', role: 'statictext', name: 'Body A' },
+              { ref: 'p1:3', role: 'generic', name: 'Author B' },
+              { ref: 'p1:4', role: 'paragraph', name: 'Body B' },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text.indexOf('Author A')).toBeLessThan(text.indexOf('Body A'));
+      expect(text.indexOf('Body A')).toBeLessThan(text.indexOf('Author B'));
+      expect(text.indexOf('Author B')).toBeLessThan(text.indexOf('Body B'));
+    });
+
     it('does not duplicate snapshot_id when the driver text already carries it', () => {
       const result = toPiToolResult(
         {

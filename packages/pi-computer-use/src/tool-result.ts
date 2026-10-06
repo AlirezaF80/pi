@@ -330,6 +330,24 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       );
     const omittedEmpty = records.filter(emptyStructural).length;
     const candidates = records.filter((record) => !emptyStructural(record));
+    const contentPriority = (record: Record<string, unknown>) => {
+      const hasReadableText = ['name', 'label'].some(
+        (field) => typeof record[field] === 'string' && (record[field] as string).trim().length > 0,
+      );
+      const role = record.role;
+      if (role === 'listmarker') {
+        const name = typeof record.name === 'string' ? record.name.trim() : '';
+        return /^\d+[.)]?$/.test(name) ? 2 : 5;
+      }
+      if (hasReadableText) return 0;
+      if (
+        Array.isArray(record.actions) &&
+        record.actions.some((action) => typeof action === 'string' && action.trim().length > 0)
+      ) {
+        return 3;
+      }
+      return 4;
+    };
     // Put editable controls before decorative clickable images on crowded pages.
     const ranked =
       key === 'refs'
@@ -340,7 +358,15 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
               (Number(Array.isArray(a.actions) && a.actions.includes('type')) * 2 +
                 Number(typeof a.name === 'string' && a.name.length > 0)),
           )
-        : candidates;
+        : key === 'content_refs'
+          ? candidates
+              .map((record, index) => ({ record, index }))
+              .sort(
+                (a, b) =>
+                  contentPriority(a.record) - contentPriority(b.record) || a.index - b.index,
+              )
+              .map(({ record }) => record)
+          : candidates;
     let shown = 0;
     for (const record of ranked) {
       const id = record[idKey];
