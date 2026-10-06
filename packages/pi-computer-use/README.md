@@ -132,6 +132,8 @@ Browser state uses an 8KB/120-line enrichment budget; desktop enrichment retains
 
 ## Ordinary browser requests
 
+Browser tools accept an omitted `session`. The extension supplies a private label for the Pi session and defaults `get_browser_state` to `snapshot_format: "semantic_v2"`. After a successful browser binding, later calls with that `target_id` and no session reuse the binding's session. Explicit session labels are preserved. A conflicting explicit label for a known target returns an error explaining how to reuse the binding or bind again; the extension does not silently reroute the call. Binding hints are cleared on Pi session transitions and before reconnecting the driver. The driver remains responsible for target validity, grants, and native session ownership.
+
 Users can ask to find products or read reviews in normal language. The extension augments the live browser tool descriptions with preparation and observation guidance: start an isolated browser for public browsing, discover and bind its window, prefer semantic snapshots, and avoid repeatedly guessing empty queries. Process identifiers and refs are handled by the agent. This guidance ships with the extension and does not require a custom system prompt from a launcher. It guides the model; it does not replace confirmations or enforce a transaction policy.
 
 ## License

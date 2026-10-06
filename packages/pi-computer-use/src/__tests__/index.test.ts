@@ -143,6 +143,7 @@ vi.mock('../vision.js', () => ({
 interface RegisteredTool {
   name: string;
   description: string;
+  parameters: { required?: string[] };
   execute: (
     id: string,
     params: Record<string, unknown>,
@@ -255,6 +256,51 @@ describe('computerUseExtension', () => {
     expect(connects).toBe(0);
     expect(tools.has('computer_use_platform_specific_tool')).toBe(false);
     expect(tools.has('computer_use_click')).toBe(true);
+  });
+
+  it('keeps omitted browser sessions stable and rejects conflicting target sessions', async () => {
+    await start();
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    mockCallTool = (name, args) => {
+      calls.push({ name, args });
+      return name === 'get_browser_state'
+        ? {
+            content: [{ type: 'text', text: 'Bound.' }],
+            structuredContent: { target_id: 'target-1' },
+          }
+        : { content: [{ type: 'text', text: 'OK.' }] };
+    };
+    const state = tools.get('computer_use_get_browser_state')!;
+    const pointer = tools.get('computer_use_browser_pointer')!;
+    expect(pointer.parameters.required ?? []).not.toContain('session');
+    await state.execute('bind', { pid: 1, window_id: 2 }, undefined, undefined, mockCtx);
+    const binding = calls.find((call) => call.name === 'get_browser_state')!.args;
+    expect(binding.snapshot_format).toBe('semantic_v2');
+    expect(binding.session).toMatch(/^pi-/);
+    const input = { target_id: 'target-1', action: 'scroll' };
+    await pointer.execute('scroll', input, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args.session).toBe(binding.session);
+    expect(input).not.toHaveProperty('session');
+    const beforeConflict = calls.length;
+    const conflict = (await pointer.execute(
+      'conflict',
+      { ...input, session: 'different' },
+      undefined,
+      undefined,
+      mockCtx,
+    )) as { isError: boolean; content: Array<{ text: string }> };
+    expect(conflict.isError).toBe(true);
+    expect(conflict.content[0].text).toContain('Omit session');
+    expect(calls).toHaveLength(beforeConflict);
+    await state.execute(
+      'named-bind',
+      { pid: 1, window_id: 2, session: 'named' },
+      undefined,
+      undefined,
+      mockCtx,
+    );
+    await pointer.execute('named-scroll', input, undefined, undefined, mockCtx);
+    expect(calls.at(-1)!.args.session).toBe('named');
   });
 
   it('requests macOS permissions once on the first computer-use call', async () => {
