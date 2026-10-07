@@ -289,6 +289,18 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
   }
   if (Object.keys(handles).length > 0) parts.push(JSON.stringify(handles));
   if (toolName === 'browser_prepare') return parts.length > 1 ? parts.join('\n') : undefined;
+  const refusal = sc.refusal;
+  if (
+    toolName === 'get_browser_state' &&
+    sc.status === 'refused' &&
+    typeof refusal === 'object' &&
+    refusal !== null &&
+    (refusal as Record<string, unknown>).code === 'browser_ref_stale'
+  ) {
+    parts.push(
+      'The browser rejected a stale ref or continuation. Take a fresh semantic_v2 snapshot with the same target_id and tab_id, omitting continuation, query, and scope_ref. Use refs and continuation values only from the latest returned observation; pass continuation only when that snapshot is incomplete.',
+    );
+  }
 
   const snapshot = sc.snapshot;
   if (snapshot && typeof snapshot === 'object') {

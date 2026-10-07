@@ -113,6 +113,61 @@ describe('toPiToolResult', () => {
       expect(invalidText).not.toContain('"complete"');
     });
 
+    it('adds recovery guidance only for stale browser snapshot refs', () => {
+      const stale = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'refused (browser_ref_stale): stale continuation.' }],
+          structuredContent: {
+            status: 'refused',
+            refusal: { code: 'browser_ref_stale', message: 'stale continuation' },
+          },
+          isError: true,
+        },
+        'get_browser_state',
+      );
+      const staleText = stale.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(stale.isError).toBe(true);
+      expect(staleText).toContain('refused (browser_ref_stale): stale continuation.');
+      expect(staleText).toContain('fresh semantic_v2 snapshot');
+      expect(staleText).toContain('same target_id and tab_id');
+      expect(staleText).toContain('omitting continuation, query, and scope_ref');
+      expect(staleText).toContain('latest returned observation');
+
+      const unrelated = toPiToolResult(
+        {
+          content: [
+            { type: 'text', text: 'refused (browser_route_unavailable): route unavailable.' },
+          ],
+          structuredContent: {
+            status: 'refused',
+            refusal: { code: 'browser_route_unavailable', message: 'route unavailable' },
+          },
+          isError: true,
+        },
+        'get_browser_state',
+      );
+      const unrelatedText = unrelated.content
+        .map((item) => ('text' in item ? item.text : ''))
+        .join('\n');
+      expect(unrelated.isError).toBe(true);
+      expect(unrelatedText).not.toContain('fresh semantic_v2 snapshot');
+
+      const otherTool = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'refused (browser_ref_stale): stale ref.' }],
+          structuredContent: {
+            status: 'refused',
+            refusal: { code: 'browser_ref_stale', message: 'stale ref' },
+          },
+          isError: true,
+        },
+        'browser_click',
+      );
+      expect(
+        otherTool.content.map((item) => ('text' in item ? item.text : '')).join('\n'),
+      ).not.toContain('fresh semantic_v2 snapshot');
+    });
+
     it('keeps late page context visible when empty structural refs crowd the snapshot', () => {
       const emptyRefs = Array.from({ length: 100 }, (_, index) => ({
         ref: `p8:${index}`,
