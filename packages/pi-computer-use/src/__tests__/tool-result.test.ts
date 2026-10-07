@@ -282,6 +282,185 @@ describe('toPiToolResult', () => {
       expect(text).toContain('3 of 3 records shown');
     });
 
+    it('uses explicit uniform content-ref defaults to preserve late named content', () => {
+      const records = Array.from({ length: 80 }, (_, index) => ({
+        ref: `p2:${index + 1}`,
+        role: 'statictext',
+        name: `Neutral note ${index + 1} with repeated source text context abcdefghijklmnopqrstuvwxyz`,
+        frame: 'main',
+        actions: [] as string[],
+      }));
+      records[30]!.name = 'AI summary label';
+      records[34]!.name = 'Field author Rowan Example';
+      records[39]!.name = 'First neutral body';
+      records[46]!.name = 'Workshop author Casey Example';
+      records[51]!.name = 'Second neutral body';
+      records[57]!.name = 'Reading author Morgan Example';
+      records[62]!.name = 'Third neutral body';
+      records[70]!.value = 'private typed value';
+      const result = toPiToolResult(
+        {
+          content: [{ type: 'text', text: 'Neutral page snapshot.' }],
+          structuredContent: {
+            target_id: 'target-neutral',
+            tab_id: 'tab-neutral',
+            snapshot: {
+              complete: false,
+              scope: 'viewport',
+              selected_nodes: 80,
+              total_nodes: 300,
+              continuation: 'opaque-neutral-token',
+            },
+            refs: Array.from({ length: 20 }, (_, index) => ({
+              ref: `action-${index + 1}`,
+              role: 'button',
+              name: `Continue action ${index + 1} ${'x'.repeat(100)}`,
+              frame: 'main',
+              visibility: 'visible',
+              actions: ['click'],
+            })),
+            content_refs: records,
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      for (const value of [
+        'Field author Rowan Example',
+        'First neutral body',
+        'Workshop author Casey Example',
+        'Second neutral body',
+        'Reading author Morgan Example',
+        'Third neutral body',
+      ])
+        expect(text).toContain(value);
+      expect(text).toContain('Content ref defaults: {"frame":"main","actions":[]}');
+      expect(text.indexOf('AI summary label')).toBeLessThan(
+        text.indexOf('Field author Rowan Example'),
+      );
+      const visibleActionRecords = text
+        .split('\n')
+        .filter((line) => line.includes('"ref":"action-'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(visibleActionRecords.length).toBeGreaterThan(0);
+      expect(visibleActionRecords.length).toBeLessThan(20);
+      expect(
+        visibleActionRecords.every(
+          (record) =>
+            record.role === 'button' &&
+            record.frame === 'main' &&
+            typeof record.name === 'string' &&
+            record.visibility === 'visible' &&
+            Array.isArray(record.actions) &&
+            record.actions[0] === 'click',
+        ),
+      ).toBe(true);
+      expect(text).toContain('"ref":"p2:80"');
+      expect(text).toContain('target-neutral');
+      expect(text).toContain('opaque-neutral-token');
+      expect(text).toContain('"ref":"action-1"');
+      expect(text).toContain('"name":"Continue action 1');
+      expect(text).toContain('"frame":"main"');
+      expect(text).toContain('"visibility":"visible"');
+      expect(text).toContain('"actions":["click"]');
+      expect(text).not.toContain('private typed value');
+      expect(
+        Buffer.byteLength(
+          JSON.stringify({ content: result.content, details: result.details }),
+          'utf8',
+        ),
+      ).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+    });
+
+    it('reports truthful shown and total counts for oversized compact content refs', () => {
+      const records = Array.from({ length: 280 }, (_, index) => ({
+        ref: `p3:${index + 1}`,
+        role: 'statictext',
+        name: `Long neutral content record ${index + 1} ${'context '.repeat(12)}`,
+        frame: 'main',
+        actions: [],
+      }));
+      const result = toPiToolResult(
+        { content: [], structuredContent: { content_refs: records } },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      const count = text.match(/content_refs: (\d+) of 280 records shown/);
+      expect(count).not.toBeNull();
+      expect(Number(count?.[1])).toBeGreaterThan(0);
+      expect(Number(count?.[1])).toBeLessThan(280);
+      expect(text).toContain('"ref":"p3:1"');
+      expect(text).not.toContain('"ref":"p3:280"');
+      expect(
+        Buffer.byteLength(
+          JSON.stringify({ content: result.content, details: result.details }),
+          'utf8',
+        ),
+      ).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+    });
+
+    it('keeps per-record fields when content-ref defaults are not uniform', () => {
+      const mixedFrames = toPiToolResult(
+        {
+          content: [],
+          structuredContent: {
+            content_refs: [
+              { ref: 'p1:1', role: 'text', name: 'First', frame: 'main', actions: [] },
+              { ref: 'p1:2', role: 'text', name: 'Second', frame: 'child', actions: [] },
+              { ref: 'p1:3', role: 'text', name: 'Third', actions: [] },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const mixedFrameText = mixedFrames.content
+        .map((item) => ('text' in item ? item.text : ''))
+        .join('\n');
+      expect(mixedFrameText).toContain('Content ref defaults: {"actions":[]}');
+      expect(mixedFrameText).toContain('"frame":"main"');
+      expect(mixedFrameText).toContain('"frame":"child"');
+      expect(mixedFrameText.match(/"actions"/g)?.length).toBe(1);
+
+      const mixedActions = toPiToolResult(
+        {
+          content: [],
+          structuredContent: {
+            content_refs: [
+              { ref: 'p1:1', role: 'text', name: 'First', frame: 'main', actions: [] },
+              { ref: 'p1:2', role: 'text', name: 'Second', frame: 'main', actions: ['click'] },
+              { ref: 'p1:3', role: 'text', name: 'Third', frame: 'main', actions: [] },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const mixedActionText = mixedActions.content
+        .map((item) => ('text' in item ? item.text : ''))
+        .join('\n');
+      expect(mixedActionText).toContain('Content ref defaults: {"frame":"main"}');
+      expect(mixedActionText).toContain('"frame":"main"');
+      expect(mixedActionText).toContain('"actions":["click"]');
+      expect(mixedActionText).toContain('"actions":[]');
+    });
+
+    it('keeps fields on a single content ref without adding a defaults header', () => {
+      const result = toPiToolResult(
+        {
+          content: [],
+          structuredContent: {
+            content_refs: [
+              { ref: 'p1:1', role: 'text', name: 'Single result', frame: 'main', actions: [] },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+      expect(text).not.toContain('Content ref defaults:');
+      expect(text).toContain('"frame":"main"');
+      expect(text).toContain('"actions":[]');
+    });
+
     it('preserves readable author and body order across different roles', () => {
       const result = toPiToolResult(
         {

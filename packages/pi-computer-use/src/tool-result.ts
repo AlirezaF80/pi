@@ -166,8 +166,8 @@ export function toPiToolResult(
 
 const ENRICHMENT_MAX_BYTES = 4 * 1024;
 const ENRICHMENT_MAX_LINES = 60;
-const BROWSER_MAX_BYTES = 8 * 1024;
-const BROWSER_MAX_LINES = 120;
+const BROWSER_MAX_BYTES = 20 * 1024;
+const BROWSER_MAX_LINES = 200;
 const LIST_WINDOWS_MAX_RECORDS = 20;
 // Matches the tree-row format the cua-driver 0.28.x MCP text output emits
 // ("- [N] <role> ..."). Undocumented upstream format; a false positive only
@@ -342,6 +342,18 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       );
     const omittedEmpty = records.filter(emptyStructural).length;
     const candidates = records.filter((record) => !emptyStructural(record));
+    const contentDefaults: Record<string, unknown> = {};
+    if (key === 'content_refs' && candidates.length >= 3) {
+      if (candidates.every((record) => record.frame === 'main')) contentDefaults.frame = 'main';
+      if (
+        candidates.every((record) => Array.isArray(record.actions) && record.actions.length === 0)
+      ) {
+        contentDefaults.actions = [];
+      }
+      if (Object.keys(contentDefaults).length > 0) {
+        parts.push(`Content ref defaults: ${JSON.stringify(contentDefaults)}`);
+      }
+    }
     const contentPriority = (record: Record<string, unknown>) => {
       const hasReadableText = ['name', 'label'].some(
         (field) => typeof record[field] === 'string' && (record[field] as string).trim().length > 0,
@@ -385,19 +397,22 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       if (typeof id !== 'string' || !id || id.length > 256) continue;
       const visible: Record<string, unknown> = { [idKey]: id };
       for (const field of ['title', 'frame', 'role', 'name', 'node', 'label', 'visibility']) {
+        if (key === 'content_refs' && field === 'frame' && 'frame' in contentDefaults) continue;
         if (typeof record[field] === 'string') visible[field] = record[field].slice(0, 160);
       }
       if (Array.isArray(record.actions)) {
-        visible.actions = record.actions
-          .filter((action) => typeof action === 'string' && action.length <= 40)
-          .slice(0, 10);
+        if (!(key === 'content_refs' && 'actions' in contentDefaults)) {
+          visible.actions = record.actions
+            .filter((action) => typeof action === 'string' && action.length <= 40)
+            .slice(0, 10);
+        }
       }
       if (typeof record.active === 'boolean') visible.active = record.active;
       const line = JSON.stringify(visible);
+      const byteBudget = key === 'content_refs' ? BROWSER_MAX_BYTES - 2048 : 4096;
       if (
         parts.length >= BROWSER_MAX_LINES - 30 ||
-        byteLength([...parts, line].join('\n')) >
-          BROWSER_MAX_BYTES - (key === 'content_refs' ? 2048 : 4096)
+        byteLength([...parts, line].join('\n')) > byteBudget
       ) {
         break;
       }
