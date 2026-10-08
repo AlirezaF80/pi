@@ -5,6 +5,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import toolManifest from '../generated/cua-driver-tools.js';
 
+const domMock = vi.hoisted(() => ({ rememberPrepared: vi.fn(), bind: vi.fn(), read: vi.fn(), clear: vi.fn() }));
+vi.mock('../owned-browser-dom.js', () => ({ OwnedBrowserDomReader: class {
+  rememberPrepared = domMock.rememberPrepared;
+  bind = domMock.bind;
+  read = domMock.read;
+  clear = domMock.clear;
+} }));
+
 Object.defineProperty(process, 'platform', { value: 'darwin' });
 
 type UpstreamResult = {
@@ -205,6 +213,10 @@ async function start(config?: Record<string, unknown>, platform = 'darwin') {
 
 describe('computerUseExtension', () => {
   beforeEach(() => {
+    domMock.rememberPrepared.mockReset().mockResolvedValue(undefined);
+    domMock.bind.mockReset().mockResolvedValue(undefined);
+    domMock.read.mockReset().mockResolvedValue({ content: [{ type: 'text', text: 'DOM product text' }], details: undefined });
+    domMock.clear.mockClear();
     mockConnect = async () => {};
     mockCallTool = (name) =>
       name === 'check_permissions'
@@ -225,6 +237,56 @@ describe('computerUseExtension', () => {
     vi.restoreAllMocks();
     for (const handler of handlers.session_shutdown ?? []) await handler({}, mockCtx);
     Object.defineProperty(process, 'platform', { value: 'darwin' });
+  });
+
+  it('reads DOM only after driver-owned isolated preparation and exact binding on Windows', async () => {
+    vi.spyOn(CuaDriverClient.prototype, 'ensureReady').mockResolvedValue(undefined);
+    vi.spyOn(CuaDriverClient.prototype, 'getState').mockReturnValue('ready');
+    vi.spyOn(CuaDriverClient.prototype, 'listAllTools').mockResolvedValue([...toolManifest.tools]);
+    vi.spyOn(CuaDriverClient.prototype, 'callTool').mockImplementation(async (name, args, signal) => mockCallTool(name, args, signal) as never);
+    await start({ mode: 'path', binaryPath: 'mock-driver', confirmDangerousActions: false }, 'win32');
+    mockCallTool = (name, args) => {
+      if (name === 'browser_prepare') return { structuredContent: {
+        status: 'ok', action: 'launched_isolated_browser', prepared_pid: 42,
+        endpoint_ownership: { method: 'spawned_by_driver', owner_pid: 42, listener_pid: 42 },
+      } };
+      if (name === 'get_browser_state' && args.pid) return { structuredContent: {
+        status: 'ok', binding_quality: 'exact', binding_route: 'native_cdp_window',
+        endpoint_access_class: 'driver_owned', target_id: 'target',
+        tabs: [{ tab_id: 'tab', url: 'about:blank' }],
+      } };
+      return { structuredContent: { status: 'ok', target_id: 'target', tab_id: 'tab', url: 'https://example.com/' } };
+    };
+    const run = (name: string, params: Record<string, unknown>) => tools.get(`computer_use_${name}`)!.execute('id', params, undefined, undefined, mockCtx);
+    await run('browser_prepare', { allow_launch: true, profile: { mode: 'isolated_new' } });
+    await run('get_browser_state', { pid: 42, window_id: 7 });
+    const result = await run('browser_read_dom', { target_id: 'target', tab_id: 'tab', selector: 'h1' });
+    expect(domMock.rememberPrepared).toHaveBeenCalledWith(42, undefined);
+    expect(domMock.bind).toHaveBeenLastCalledWith('target', 'tab', 42, 'https://example.com/', undefined);
+    expect(domMock.read).toHaveBeenCalledWith('target', 'tab', 'h1', undefined, 0);
+    expect(result).toEqual({ content: [{ type: 'text', text: 'DOM product text' }], details: undefined });
+    domMock.read.mockClear();
+    mockCallTool = () => ({ structuredContent: { status: 'refused' } });
+    const stale = await run('browser_read_dom', { target_id: 'target', tab_id: 'tab', selector: 'h1' }) as any;
+    expect(stale.isError).toBe(true);
+    expect(domMock.read).not.toHaveBeenCalled();
+  });
+
+  it('refuses DOM reading for a personal or unprepared browser and clears ownership on shutdown', async () => {
+    vi.spyOn(CuaDriverClient.prototype, 'ensureReady').mockResolvedValue(undefined);
+    vi.spyOn(CuaDriverClient.prototype, 'getState').mockReturnValue('ready');
+    vi.spyOn(CuaDriverClient.prototype, 'listAllTools').mockResolvedValue([...toolManifest.tools]);
+    vi.spyOn(CuaDriverClient.prototype, 'callTool').mockImplementation(async (name, args, signal) => mockCallTool(name, args, signal) as never);
+    await start({ mode: 'path', binaryPath: 'mock-driver', confirmDangerousActions: false }, 'win32');
+    mockCallTool = () => ({ structuredContent: { status: 'ok', prepared_pid: 42 } });
+    await tools.get('computer_use_browser_prepare')!.execute('id', { profile: { mode: 'existing' } }, undefined, undefined, mockCtx);
+    const result = await tools.get('computer_use_browser_read_dom')!.execute('id', { target_id: 'target', tab_id: 'tab', selector: 'h1' }, undefined, undefined, mockCtx) as any;
+    expect(result.isError).toBe(true);
+    expect(domMock.rememberPrepared).not.toHaveBeenCalled();
+    expect(domMock.read).not.toHaveBeenCalled();
+    const count = domMock.clear.mock.calls.length;
+    for (const handler of handlers.session_shutdown ?? []) await handler({}, mockCtx);
+    expect(domMock.clear.mock.calls.length).toBeGreaterThan(count);
   });
 
   it('registers the pinned Rust tool manifest on macOS', async () => {

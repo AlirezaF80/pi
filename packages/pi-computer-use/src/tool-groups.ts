@@ -42,6 +42,7 @@ export const TOOL_GROUPS: Readonly<Record<string, ToolGroup>> = {
       'browser_download',
       'browser_pointer',
       'get_browser_state',
+      'browser_read_dom',
       'page',
     ],
   },

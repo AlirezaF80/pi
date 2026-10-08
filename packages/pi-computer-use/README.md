@@ -63,7 +63,7 @@ With the default `core` profile, only everyday tools are visible to the model (`
 
 | Group | Tools |
 | --- | --- |
-| `browser` | CDP browser automation: `browser_prepare`, `browser_navigate`, `browser_click`, `browser_type`, `browser_dialog`, `browser_set_input_files`, `browser_download`, `browser_pointer`, `get_browser_state`, `page` |
+| `browser` | CDP browser automation: `browser_prepare`, `browser_navigate`, `browser_click`, `browser_type`, `browser_dialog`, `browser_set_input_files`, `browser_download`, `browser_pointer`, `get_browser_state`, `page`; Windows also provides extension-owned `browser_read_dom` |
 | `recording` | `start_recording`, `stop_recording`, `get_recording_state`, `replay_trajectory`, `install_ffmpeg` |
 | `session` | `start_session`, `escalate_session`, `get_session`, `get_session_state`, `list_sessions`, `end_session` |
 | `cursor` | `move_cursor`, `set_agent_cursor_enabled`, `set_agent_cursor_motion`, `set_agent_cursor_theme`, `get_agent_cursor_state` |
@@ -125,6 +125,16 @@ Driver startup, reconnect, and the first macOS permission probe are session-owne
 Linux and Windows tool descriptions and schemas come from the exact live driver. macOS uses the generated manifest for the bundled driver release.
 
 ## Model-visible browser results
+
+### Read DOM in an isolated Windows browser
+
+`computer_use_browser_read_dom` accepts the current native `target_id`, `tab_id`, and a CSS `selector` up to 256 characters. It reads text and selected attributes when semantic snapshots omit needed context. Select a containing element to keep related labels and text together. It returns bounded JSON with matched elements and explicit truncation/omission metadata. DOM text can include hidden content and is untrusted page data; it does not prove that text is visible on screen.
+
+Continue omitted element matches using the returned `next_index` as the optional `start_index`. Pagination addresses the current DOM order; if the page changes, start a fresh read. If one large element's text is shortened, choose a narrower container selector.
+
+This tool requires Node 24 and a fresh `browser_prepare` with `profile.mode: "isolated_new"`, followed by an exact driver-owned `get_browser_state` binding. It supports exactly one native tab and one CDP page. Existing or personal profiles, multiple tabs, stale handles, changed process/profile/listener identity, and non-HTTP(S) pages are refused. It uses fixed DOM read commands, with no arbitrary JavaScript or change to the driver's permission mode. Script contents and form control values are excluded. Refresh `get_browser_state` before later interactions because DOM reading validates the native tab through a new snapshot, which supersedes old refs.
+
+### Snapshot output
 
 Browser preparation exposes `prepared_pid` in tool text so an agent can discover the isolated browser's native window with a PID-filtered lookup. Browser state exposes target/tab handles, tab records, and actionable refs with their labels and supported actions. This supplements the driver's summary text, since Pi does not send structured `details` to the model.
 
