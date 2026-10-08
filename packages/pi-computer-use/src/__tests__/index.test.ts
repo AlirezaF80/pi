@@ -281,6 +281,7 @@ describe('computerUseExtension', () => {
     expect(state.description).toContain('Never construct a continuation');
     expect(tools.get('computer_use_list_windows')!.description).toContain('leave session omitted');
     expect(tools.get('computer_use_list_windows')!.description).toContain('exact prepared_pid');
+    expect(pointer.description).toContain('For scroll, provide either a current page ref or both viewport x and y coordinates.');
     expect(pointer.parameters.required ?? []).not.toContain('session');
     await state.execute('bind', { pid: 1, window_id: 2 }, undefined, undefined, mockCtx);
     const binding = calls.find((call) => call.name === 'get_browser_state')!.args;
