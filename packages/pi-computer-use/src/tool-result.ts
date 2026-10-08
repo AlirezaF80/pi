@@ -396,10 +396,15 @@ function buildBrowserEnrichment(toolName: string, sc: Record<string, unknown>): 
       const id = record[idKey];
       if (typeof id !== 'string' || !id || id.length > 256) continue;
       const visible: Record<string, unknown> = { [idKey]: id };
+      const truncatedFields: string[] = [];
       for (const field of ['title', 'frame', 'role', 'name', 'node', 'label', 'visibility']) {
         if (key === 'content_refs' && field === 'frame' && 'frame' in contentDefaults) continue;
-        if (typeof record[field] === 'string') visible[field] = record[field].slice(0, 160);
+        if (typeof record[field] === 'string') {
+          visible[field] = record[field].slice(0, 160);
+          if (record[field].length > 160) truncatedFields.push(field);
+        }
       }
+      if (truncatedFields.length > 0) visible.truncated_fields = truncatedFields;
       if (Array.isArray(record.actions)) {
         if (!(key === 'content_refs' && 'actions' in contentDefaults)) {
           visible.actions = record.actions

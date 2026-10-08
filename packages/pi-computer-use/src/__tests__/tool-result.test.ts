@@ -481,6 +481,26 @@ describe('toPiToolResult', () => {
       expect(text.indexOf('Author B')).toBeLessThan(text.indexOf('Body B'));
     });
 
+    it('marks only record fields shortened in model-visible snapshots', () => {
+      const result = toPiToolResult(
+        {
+          structuredContent: {
+            refs: [
+              { ref: 'p1:1', role: 'statictext', name: 'N'.repeat(161), label: 'L'.repeat(170) },
+              { ref: 'p1:2', role: 'statictext', name: 'Short name', label: 'Short label' },
+            ],
+          },
+        },
+        'get_browser_state',
+      );
+      const text = result.content.map((item) => ('text' in item ? item.text : '')).join('\n');
+
+      expect(text).toContain('"ref":"p1:1"');
+      expect(text).toContain('"truncated_fields":["name","label"]');
+      expect(text).toContain('"ref":"p1:2"');
+      expect(text).not.toContain('"truncated_fields":[]');
+    });
+
     it('does not duplicate snapshot_id when the driver text already carries it', () => {
       const result = toPiToolResult(
         {
